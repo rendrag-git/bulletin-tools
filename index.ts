@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync } fr
 import { join } from "node:path";
 import { homedir } from "node:os";
 import * as http from "node:http";
+import { postToDiscord, postToThread } from "./lib/discord-notify.ts";
 import {
   getDb,
   getUnrespondedBulletins,
@@ -475,9 +476,6 @@ const bulletinToolsPlugin = {
                   const cfg = JSON.parse(readFileSync(cfgPath, "utf-8"));
                   const botToken: string | undefined = resolveConfigToken(cfg.botToken) ?? process.env.RELAY_BOT_TOKEN;
                   if (botToken) {
-                    const { postToThread } = await import(
-                      "../../hooks/agent-coordinator/lib/discord-notify.ts"
-                    );
                     const posTag = position === "oppose" ? " ⚠️ **[OPPOSE]**"
                                  : position === "partial" ? ` ~ **[PARTIAL]**`
                                  : " ✅";
@@ -523,9 +521,7 @@ const bulletinToolsPlugin = {
                       const channel = cfg.escalationChannel;
                       const botToken = resolveConfigToken(cfg.botToken) ?? process.env.RELAY_BOT_TOKEN;
                       if (botToken) {
-                        const { postToDiscord, postToThread } = await import(
-                          "../../hooks/agent-coordinator/lib/discord-notify.ts"
-                        );
+
                         const msg = `✅ [${bulletinId}] "${updated.topic ?? bulletinId}" — majority (${alignCount}/${subscribers.length} aligned)`;
                         if (channel) await postToDiscord(channel, msg, botToken);
                         if (threadId) {
@@ -554,9 +550,7 @@ const bulletinToolsPlugin = {
                     const cfg = JSON.parse(readFileSync(cfgPath, "utf-8"));
                     const botToken: string | undefined = resolveConfigToken(cfg.botToken) ?? process.env.RELAY_BOT_TOKEN;
                     if (botToken && threadId) {
-                      const { postToThread } = await import(
-                        "../../hooks/agent-coordinator/lib/discord-notify.ts"
-                      );
+
                       await postToThread(
                         threadId,
                         `🔄 **Critique round open** — all ${subscribers.length} subscribers responded.\nEach subscriber should now review the discussion and submit a critique using \`bulletin_critique\`.`,
@@ -600,9 +594,6 @@ const bulletinToolsPlugin = {
                     }
 
                     if (dissenters.size >= threshold) {
-                      const { postToDiscord, postToThread } = await import(
-                        "../../hooks/agent-coordinator/lib/discord-notify.ts"
-                      );
                       const dissenterList = Array.from(dissenters.entries())
                         .map(([agent, text]) => `- **${agent}**: "${text}..."`)
                         .join("\n");
@@ -737,9 +728,7 @@ const bulletinToolsPlugin = {
                   const cfg = JSON.parse(readFileSync(cfgPath, "utf-8"));
                   const botToken: string | undefined = resolveConfigToken(cfg.botToken) ?? process.env.RELAY_BOT_TOKEN;
                   if (botToken) {
-                    const { postToThread } = await import(
-                      "../../hooks/agent-coordinator/lib/discord-notify.ts"
-                    );
+
                     const posTag = position === "oppose" ? " ⚠️ **[OPPOSE]**"
                                  : position === "partial" ? ` ~ **[PARTIAL]**`
                                  : " 🧐";
@@ -786,9 +775,7 @@ const bulletinToolsPlugin = {
                       const channel = cfg.escalationChannel;
                       const botToken = resolveConfigToken(cfg.botToken) ?? process.env.RELAY_BOT_TOKEN;
                       if (botToken) {
-                        const { postToDiscord, postToThread } = await import(
-                          "../../hooks/agent-coordinator/lib/discord-notify.ts"
-                        );
+
                         if (channel) {
                           await postToDiscord(
                             channel,
@@ -818,9 +805,6 @@ const bulletinToolsPlugin = {
                     const channel = cfg.escalationChannel;
                     const botToken = resolveConfigToken(cfg.botToken) ?? process.env.RELAY_BOT_TOKEN;
                     if (botToken) {
-                      const { postToDiscord, postToThread } = await import(
-                        "../../hooks/agent-coordinator/lib/discord-notify.ts"
-                      );
                       const failMsg = [
                         `⚠️ [${bulletinId}] "${updated.topic ?? bulletinId}" — consensus not reached.`,
                         `Critique complete: ${opposeCount} oppose(s), ${partialCount} partial(s).`,
