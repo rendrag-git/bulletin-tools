@@ -1,5 +1,5 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync } from "node:fs";
+import { readFileSync, mkdirSync, existsSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import * as http from "node:http";
@@ -49,28 +49,6 @@ function resolveConfigToken(rawToken: string | undefined): string | undefined {
   return rawToken;
 }
 
-function getGatewayPort(): number {
-  const envPort = process.env.OPENCLAW_GATEWAY_PORT;
-  if (envPort) return parseInt(envPort, 10) || 18789;
-  try {
-    const config = JSON.parse(
-      readFileSync(join(homedir(), ".openclaw", "openclaw.json"), "utf-8"),
-    );
-    return config.gateway?.port ?? 18789;
-  } catch {
-    return 18789;
-  }
-}
-
-function getGatewayToken(): string | undefined {
-  try {
-    const cfgPath = join(homedir(), ".openclaw", "mailroom", "bulletin-config.json");
-    const cfg = JSON.parse(readFileSync(cfgPath, "utf-8"));
-    return resolveConfigToken(cfg.gatewayToken);
-  } catch {
-    return process.env.GATEWAY_AUTH_TOKEN;
-  }
-}
 
 const BULLETINS_DIR = join(homedir(), ".openclaw", "mailroom", "bulletins");
 const AUDIT_LOG_PATH = join(BULLETINS_DIR, "audit.log");
@@ -153,45 +131,6 @@ function buildCloseSummary(bulletin: ReturnType<typeof loadBulletin>): string {
   return lines.join("\n");
 }
 
-const LOCKS_DIR = join(BULLETINS_DIR, ".locks");
-const LOCK_TTL_MS = 10 * 60 * 1000; // 10 minutes
-
-interface SpawnLock {
-  spawnedAt: string;
-  bulletinIds: string[];
-  sessionKey: string;
-}
-
-function lockPath(agentId: string): string {
-  return join(LOCKS_DIR, `${agentId}.json`);
-}
-
-function readLock(agentId: string): SpawnLock | null {
-  const lp = lockPath(agentId);
-  if (!existsSync(lp)) return null;
-  try {
-    const lock = JSON.parse(readFileSync(lp, "utf-8")) as SpawnLock;
-    const age = Date.now() - new Date(lock.spawnedAt).getTime();
-    if (age > LOCK_TTL_MS) {
-      return null;
-    }
-    return lock;
-  } catch {
-    return null;
-  }
-}
-
-function writeLock(agentId: string, bulletinIds: string[], sessionKey: string): void {
-  if (!existsSync(LOCKS_DIR)) {
-    mkdirSync(LOCKS_DIR, { recursive: true });
-  }
-  const lock: SpawnLock = {
-    spawnedAt: new Date().toISOString(),
-    bulletinIds,
-    sessionKey,
-  };
-  writeFileSync(lockPath(agentId), JSON.stringify(lock, null, 2) + "\n", "utf-8");
-}
 
 function buildBulletinTaskPrompt(bulletins: Array<{ id: string; topic: string; body: string; responses: any[]; resolvedSubscribers: string[] }>): string {
   const sections: string[] = [
@@ -276,91 +215,6 @@ function buildBulletinTaskPrompt(bulletins: Array<{ id: string; topic: string; b
   return sections.join("\n");
 }
 
-/**
- * Wake an agent to handle pending bulletins by spawning a subagent session
- * via the Gateway HTTP API (/tools/invoke → sessions_spawn).
- */
-async function wakeAgentViaGateway(
-  agentId: string,
-  bulletins: Array<{ id: string; topic: string; body: string; responses: any[]; resolvedSubscribers: string[] }>,
-  label: string,
-): Promise<boolean> {
-  const existing = readLock(agentId);
-  if (existing) {
-    const incomingIds = new Set(bulletins.map((b) => b.id));
-    const lockLabel = `gateway-spawn-${label}`;
-    const sameRound = existing.sessionKey === lockLabel;
-    const overlapping = existing.bulletinIds.some((id) => incomingIds.has(id));
-    if (sameRound && overlapping) {
-      console.log(
-        `[bulletin-tools] Skipping wake for '${agentId}' — lock exists for same round (${existing.bulletinIds.join(", ")})`,
-      );
-      return false;
-    }
-    // Different round or different bulletins — allow the wake
-    console.log(
-      `[bulletin-tools] Overriding lock for '${agentId}' — different round (${existing.sessionKey} → ${lockLabel}) or new bulletins`,
-    );
-  }
-
-  const gatewayToken = getGatewayToken();
-  if (!gatewayToken) {
-    console.error("[bulletin-tools] No GATEWAY_AUTH_TOKEN — cannot wake agent");
-    return false;
-  }
-
-  const bulletinIds = bulletins.map((b) => b.id);
-  const task = buildBulletinTaskPrompt(bulletins);
-  const payload = JSON.stringify({
-    tool: "sessions_spawn",
-    args: {
-      task,
-      agentId,
-      mode: "run",
-      cleanup: "delete",
-      runTimeoutSeconds: 120,
-      label: `bulletin-${label}`,
-    },
-  });
-
-  return new Promise((resolve) => {
-    const port = getGatewayPort();
-    const req = http.request(
-      {
-        hostname: "127.0.0.1",
-        port,
-        path: "/tools/invoke",
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${gatewayToken}`,
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(payload),
-        },
-      },
-      (res) => {
-        let body = "";
-        res.on("data", (c) => (body += c));
-        res.on("end", () => {
-          const ok = res.statusCode !== undefined && res.statusCode >= 200 && res.statusCode < 300;
-          if (ok) {
-            writeLock(agentId, bulletinIds, `gateway-spawn-${label}`);
-            auditLog(`WAKE agent=${agentId} bulletins=${bulletinIds.join(",")} label=${label} status=${res.statusCode}`);
-            console.log(`[bulletin-tools] Woke '${agentId}' via Gateway: ${bulletinIds.join(", ")}`);
-          } else {
-            console.error(`[bulletin-tools] Gateway wake failed for '${agentId}': ${res.statusCode} ${body}`);
-          }
-          resolve(ok);
-        });
-      },
-    );
-    req.on("error", (e) => {
-      console.error(`[bulletin-tools] Gateway wake error for '${agentId}': ${e.message}`);
-      resolve(false);
-    });
-    req.write(payload);
-    req.end();
-  });
-}
 
 // ── bulletin_list helpers ───────────────────────────────────────────────────
 
@@ -606,7 +460,7 @@ const bulletinToolsPlugin = {
                       (c: any) => c.agentId === subId,
                     );
                     if (!alreadyCritiqued && latestBulletin) {
-                      await wakeAgentViaGateway(subId, [latestBulletin], "critique-round");
+                      await wakeBulletinSubscriber(subId, [latestBulletin], "critique-round");
                     }
                   }
                 } catch { /* best effort */ }
@@ -928,6 +782,140 @@ const bulletinToolsPlugin = {
       { names: ["bulletin_list"] },
     );
 
+    // ── Gateway method: bulletin_wake ────────────────────────────────
+    // Creates an immediate one-shot cron job with lightContext for each agent.
+    // Replaces sessions_spawn — no subagent_announce, no spawn locks.
+
+    api.registerGatewayMethod("bulletin_wake", async ({ params, context, respond }) => {
+      const agentId = params.agentId as string;
+      const task = params.task as string;
+      const label = params.label as string;
+
+      if (!agentId || !task || !label) {
+        respond(false, undefined, { code: "INVALID_PARAMS", message: "agentId, task, and label are required" });
+        return;
+      }
+
+      const jobName = `bulletin-${label}`;
+
+      // Idempotency: skip if a job with this name already exists and hasn't run
+      try {
+        const existing = await context.cron.list();
+        const duplicate = existing.find((j: any) => j.name === jobName && j.enabled);
+        if (duplicate) {
+          console.log(`[bulletin-tools] Skipping wake for '${agentId}' — job '${jobName}' already exists`);
+          respond(true, { status: "skipped", jobId: duplicate.id, reason: "duplicate" });
+          return;
+        }
+      } catch { /* list failed, proceed anyway */ }
+
+      try {
+        const job = await context.cron.add({
+          name: jobName,
+          agentId,
+          enabled: true,
+          deleteAfterRun: true,
+          schedule: { kind: "at" as const, at: new Date().toISOString() },
+          sessionTarget: "isolated" as const,
+          wakeMode: "now" as const,
+          payload: {
+            kind: "agentTurn" as const,
+            message: task,
+            lightContext: true,
+            thinking: "low",
+            timeoutSeconds: 60,
+          },
+          delivery: { mode: "none" as const },
+        });
+
+        // Force immediate execution — don't wait for cron tick
+        await context.cron.run(job.id, "force");
+
+        auditLog(`WAKE agent=${agentId} label=${label} jobId=${job.id}`);
+        console.log(`[bulletin-tools] Woke '${agentId}' via cron job: ${jobName}`);
+        respond(true, { status: "ok", jobId: job.id });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[bulletin-tools] bulletin_wake failed for '${agentId}': ${msg}`);
+        respond(false, undefined, { code: "WAKE_FAILED", message: msg });
+      }
+    });
+
+    // ── Internal wake helper ─────────────────────────────────────────
+    // Calls the bulletin_wake Gateway method via HTTP.
+
+    async function wakeBulletinSubscriber(
+      agentId: string,
+      bulletins: Array<{ id: string; topic: string; body: string; responses: any[]; resolvedSubscribers: string[] }>,
+      label: string,
+    ): Promise<boolean> {
+      const gatewayToken = (() => {
+        try {
+          const cfgPath = join(homedir(), ".openclaw", "mailroom", "bulletin-config.json");
+          const cfg = JSON.parse(readFileSync(cfgPath, "utf-8"));
+          return resolveConfigToken(cfg.gatewayToken) ?? process.env.GATEWAY_AUTH_TOKEN;
+        } catch {
+          return process.env.GATEWAY_AUTH_TOKEN;
+        }
+      })();
+
+      if (!gatewayToken) {
+        console.error("[bulletin-tools] No GATEWAY_AUTH_TOKEN — cannot wake agent");
+        return false;
+      }
+
+      const task = buildBulletinTaskPrompt(bulletins);
+      const bulletinIds = bulletins.map(b => b.id);
+      const jobLabel = `${bulletinIds.join("-")}-${agentId}-${label}`;
+
+      const gatewayPort = (() => {
+        const envPort = process.env.OPENCLAW_GATEWAY_PORT;
+        if (envPort) return parseInt(envPort, 10) || 18789;
+        try {
+          const cfg = JSON.parse(readFileSync(join(homedir(), ".openclaw", "openclaw.json"), "utf-8"));
+          return cfg.gateway?.port ?? 18789;
+        } catch { return 18789; }
+      })();
+
+      const payload = JSON.stringify({
+        method: "bulletin_wake",
+        params: { agentId, task, label: jobLabel },
+      });
+
+      return new Promise((resolve) => {
+        const req = http.request({
+          hostname: "127.0.0.1",
+          port: gatewayPort,
+          path: "/rpc",
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${gatewayToken}`,
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(payload),
+          },
+        }, (res) => {
+          let body = "";
+          res.on("data", (c: string) => (body += c));
+          res.on("end", () => {
+            const ok = res.statusCode !== undefined && res.statusCode >= 200 && res.statusCode < 300;
+            if (ok) {
+              auditLog(`WAKE agent=${agentId} bulletins=${bulletinIds.join(",")} label=${label}`);
+              console.log(`[bulletin-tools] Woke '${agentId}': ${bulletinIds.join(", ")}`);
+            } else {
+              console.error(`[bulletin-tools] Wake failed for '${agentId}': ${res.statusCode} ${body}`);
+            }
+            resolve(ok);
+          });
+        });
+        req.on("error", (e: Error) => {
+          console.error(`[bulletin-tools] Wake error for '${agentId}': ${e.message}`);
+          resolve(false);
+        });
+        req.write(payload);
+        req.end();
+      });
+    }
+
     // ── Bulletin auto-response hooks ────────────────────────────────
 
     // Track pending acknowledgments (agentId → bulletin count)
@@ -950,7 +938,7 @@ const bulletinToolsPlugin = {
           `[bulletin-tools] before_agent_start: ${agentId} has ${urgent.length} unresponded urgent bulletin(s)`,
         );
 
-        const notified = await wakeAgentViaGateway(agentId, urgent, "urgent");
+        const notified = await wakeBulletinSubscriber(agentId, urgent, "urgent");
         if (notified) {
           pendingAcks.set(agentId, urgent.length);
         }
@@ -977,7 +965,7 @@ const bulletinToolsPlugin = {
           `[bulletin-tools] agent_end: ${agentId} has ${normal.length} unresponded normal bulletin(s)`,
         );
 
-        await wakeAgentViaGateway(agentId, normal, "normal");
+        await wakeBulletinSubscriber(agentId, normal, "normal");
       } catch (err) {
         console.error(
           "[bulletin-tools] agent_end hook error:",
