@@ -916,31 +916,19 @@ const bulletinToolsPlugin = {
       });
     }
 
-    // ── Bulletin auto-response hooks ────────────────────────────────
-
-    // Track pending acknowledgments (agentId → bulletin count)
-    const pendingAcks = new Map<string, number>();
+    // ── Bulletin lifecycle hooks (passive — waking happens at post-time) ──
 
     api.on("before_agent_start", async (_event, ctx) => {
       const agentId = ctx.agentId;
       if (!agentId) return;
-
       if (ctx.sessionKey?.includes(":bulletin:")) return;
-      // Don't spawn bulletin sessions from the main DM session — avoids
-      // bulletin status chatter in the user's DMs
-      if (ctx.sessionKey === "agent:main:main") return;
 
       try {
-        const urgent = getUnrespondedBulletins(agentId, { urgent: true });
-        if (urgent.length === 0) return;
-
-        console.log(
-          `[bulletin-tools] before_agent_start: ${agentId} has ${urgent.length} unresponded urgent bulletin(s)`,
-        );
-
-        const notified = await wakeBulletinSubscriber(agentId, urgent, "urgent");
-        if (notified) {
-          pendingAcks.set(agentId, urgent.length);
+        const pending = getUnrespondedBulletins(agentId);
+        if (pending.length > 0) {
+          console.log(
+            `[bulletin-tools] ${agentId} has ${pending.length} unresponded bulletin(s)`,
+          );
         }
       } catch (err) {
         console.error(
@@ -953,49 +941,21 @@ const bulletinToolsPlugin = {
     api.on("agent_end", async (_event, ctx) => {
       const agentId = ctx.agentId;
       if (!agentId) return;
-
       if (ctx.sessionKey?.includes(":bulletin:")) return;
-      if (ctx.sessionKey === "agent:main:main") return;
 
       try {
-        const normal = getUnrespondedBulletins(agentId, { urgent: false });
-        if (normal.length === 0) return;
-
-        console.log(
-          `[bulletin-tools] agent_end: ${agentId} has ${normal.length} unresponded normal bulletin(s)`,
-        );
-
-        await wakeBulletinSubscriber(agentId, normal, "normal");
+        const pending = getUnrespondedBulletins(agentId);
+        if (pending.length > 0) {
+          console.log(
+            `[bulletin-tools] agent_end: ${agentId} still has ${pending.length} unresponded bulletin(s)`,
+          );
+        }
       } catch (err) {
         console.error(
           "[bulletin-tools] agent_end hook error:",
           err instanceof Error ? err.message : String(err),
         );
       }
-    });
-
-    api.on("before_message_write", (event, ctx) => {
-      const agentId = ctx.agentId;
-      if (!agentId) return;
-
-      const count = pendingAcks.get(agentId);
-      if (!count) return;
-
-      const msg = event.message as any;
-      if (msg?.role !== "assistant") return;
-
-      if (typeof msg.content === "string") {
-        msg.content += `\n\n---\n📋 Responding to ${count} pending bulletin(s) in the background.`;
-      } else if (Array.isArray(msg.content)) {
-        const lastText = [...msg.content].reverse().find((c: any) => c.type === "text");
-        if (lastText) {
-          lastText.text += `\n\n---\n📋 Responding to ${count} pending bulletin(s) in the background.`;
-        }
-      }
-
-      pendingAcks.delete(agentId);
-
-      return { message: msg };
     });
 
     // ── Timeout scheduler for bulletins with timeout_minutes ─────────
