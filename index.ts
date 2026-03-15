@@ -782,73 +782,125 @@ const bulletinToolsPlugin = {
       { names: ["bulletin_list"] },
     );
 
-    // ── Gateway method: bulletin_wake ────────────────────────────────
-    // Creates an immediate one-shot cron job with lightContext for each agent.
-    // Replaces sessions_spawn — no subagent_announce, no spawn locks.
+    // ── Shared wake logic ──────────────────────────────────────────────
+    // Uses api.runtime.subagent.run() to run agent turns in-process.
+    // No WS handshake, no cron service needed.
 
-    api.registerGatewayMethod("bulletin_wake", async ({ params, context, respond }) => {
-      const agentId = params.agentId as string;
-      const task = params.task as string;
-      const label = params.label as string;
+    const subagent = (api.runtime as any).subagent;
 
+    async function doBulletinWake(
+      agentId: string,
+      task: string,
+      label: string,
+    ): Promise<{ ok: true; payload: any } | { ok: false; error: { code: string; message: string } }> {
       if (!agentId || !task || !label) {
-        respond(false, undefined, { code: "INVALID_PARAMS", message: "agentId, task, and label are required" });
-        return;
+        return { ok: false, error: { code: "INVALID_PARAMS", message: "agentId, task, and label are required" } };
       }
 
-      const jobName = `bulletin-${label}`;
-
-      // Idempotency: skip if a job with this name already exists and hasn't run
-      try {
-        const existing = await context.cron.list();
-        const duplicate = existing.find((j: any) => j.name === jobName && j.enabled);
-        if (duplicate) {
-          console.log(`[bulletin-tools] Skipping wake for '${agentId}' — job '${jobName}' already exists`);
-          respond(true, { status: "skipped", jobId: duplicate.id, reason: "duplicate" });
-          return;
-        }
-      } catch { /* list failed, proceed anyway */ }
+      const sessionKey = `agent:${agentId}:bulletin:${label}`;
 
       try {
-        const job = await context.cron.add({
-          name: jobName,
-          agentId,
-          enabled: true,
-          deleteAfterRun: true,
-          schedule: { kind: "at" as const, at: new Date().toISOString() },
-          sessionTarget: "isolated" as const,
-          wakeMode: "now" as const,
-          payload: {
-            kind: "agentTurn" as const,
-            message: task,
-            lightContext: true,
-            thinking: "low",
-            timeoutSeconds: 60,
-          },
-          delivery: { mode: "none" as const },
+        const result = await subagent.run({
+          sessionKey,
+          message: task,
+          idempotencyKey: `bulletin-wake-${label}-${Date.now()}`,
         });
 
-        // Force immediate execution — don't wait for cron tick
-        await context.cron.run(job.id, "force");
-
-        auditLog(`WAKE agent=${agentId} label=${label} jobId=${job.id}`);
-        console.log(`[bulletin-tools] Woke '${agentId}' via cron job: ${jobName}`);
-        respond(true, { status: "ok", jobId: job.id });
+        auditLog(`WAKE agent=${agentId} label=${label} runId=${result.runId}`);
+        console.log(`[bulletin-tools] Woke '${agentId}' via subagent.run: ${sessionKey}`);
+        return { ok: true, payload: { status: "ok", runId: result.runId, sessionKey } };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`[bulletin-tools] bulletin_wake failed for '${agentId}': ${msg}`);
-        respond(false, undefined, { code: "WAKE_FAILED", message: msg });
+        return { ok: false, error: { code: "WAKE_FAILED", message: msg } };
+      }
+    }
+
+    // ── Gateway method: bulletin_wake (WS) — kept for compatibility ─────
+    api.registerGatewayMethod("bulletin_wake", async ({ params, respond }) => {
+      const result = await doBulletinWake(
+        params.agentId as string,
+        params.task as string,
+        params.label as string,
+      );
+      if (result.ok) {
+        respond(true, result.payload);
+      } else {
+        respond(false, undefined, result.error);
       }
     });
 
+    // ── HTTP route: /bulletin/wake ───────────────────────────────────────
+    // Primary path for bulletin-post and internal callers.
+    api.registerHttpRoute({
+      path: "/bulletin/wake",
+      auth: "gateway",
+      match: "exact" as const,
+      handler: async (req: any, res: any) => {
+        if (req.method !== "POST") {
+          res.statusCode = 405;
+          res.end(JSON.stringify({ ok: false, error: "method not allowed" }));
+          return true;
+        }
+
+        const body = await new Promise<string>((resolve) => {
+          let data = "";
+          req.on("data", (chunk: any) => (data += chunk));
+          req.on("end", () => resolve(data));
+        });
+
+        let params: any;
+        try {
+          params = JSON.parse(body);
+        } catch {
+          res.statusCode = 400;
+          res.end(JSON.stringify({ ok: false, error: "invalid JSON" }));
+          return true;
+        }
+
+        const result = await doBulletinWake(params.agentId, params.task, params.label);
+
+        res.statusCode = result.ok ? 200 : 400;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify(result));
+        return true;
+      },
+    });
+
     // ── Internal wake helper ─────────────────────────────────────────
-    // Calls the bulletin_wake Gateway method via HTTP.
+    // Tries subagent.run directly; falls back to HTTP /bulletin/wake
+    // when called outside a gateway request scope (e.g. from tool handlers).
 
     async function wakeBulletinSubscriber(
       agentId: string,
       bulletins: Array<{ id: string; topic: string; body: string; responses: any[]; resolvedSubscribers: string[] }>,
       label: string,
     ): Promise<boolean> {
+      const task = buildBulletinTaskPrompt(bulletins);
+      const bulletinIds = bulletins.map(b => b.id);
+      const jobLabel = `${bulletinIds.join("-")}-${agentId}-${label}`;
+
+      // Try direct path first
+      const result = await doBulletinWake(agentId, task, jobLabel);
+      if (result.ok) {
+        auditLog(`WAKE agent=${agentId} bulletins=${bulletinIds.join(",")} label=${label}`);
+        console.log(`[bulletin-tools] Woke '${agentId}': ${bulletinIds.join(", ")}`);
+        return true;
+      }
+
+      // If subagent.run failed because we're outside gateway request scope,
+      // fall back to HTTP self-call to /bulletin/wake
+      if (result.error.message.includes("gateway request")) {
+        console.log(`[bulletin-tools] Falling back to HTTP wake for '${agentId}'`);
+        return wakeViaHttp(agentId, task, jobLabel);
+      }
+
+      console.error(`[bulletin-tools] Wake failed for '${agentId}': ${result.error.message}`);
+      return false;
+    }
+
+    // HTTP fallback for waking agents when subagent.run isn't available
+    async function wakeViaHttp(agentId: string, task: string, label: string): Promise<boolean> {
       const gatewayToken = (() => {
         try {
           const cfgPath = join(homedir(), ".openclaw", "mailroom", "bulletin-config.json");
@@ -860,13 +912,9 @@ const bulletinToolsPlugin = {
       })();
 
       if (!gatewayToken) {
-        console.error("[bulletin-tools] No GATEWAY_AUTH_TOKEN — cannot wake agent");
+        console.error("[bulletin-tools] No GATEWAY_AUTH_TOKEN — cannot wake agent via HTTP");
         return false;
       }
-
-      const task = buildBulletinTaskPrompt(bulletins);
-      const bulletinIds = bulletins.map(b => b.id);
-      const jobLabel = `${bulletinIds.join("-")}-${agentId}-${label}`;
 
       const gatewayPort = (() => {
         const envPort = process.env.OPENCLAW_GATEWAY_PORT;
@@ -877,16 +925,13 @@ const bulletinToolsPlugin = {
         } catch { return 18789; }
       })();
 
-      const payload = JSON.stringify({
-        method: "bulletin_wake",
-        params: { agentId, task, label: jobLabel },
-      });
+      const payload = JSON.stringify({ agentId, task, label });
 
       return new Promise((resolve) => {
         const req = http.request({
           hostname: "127.0.0.1",
           port: gatewayPort,
-          path: "/rpc",
+          path: "/bulletin/wake",
           method: "POST",
           headers: {
             Authorization: `Bearer ${gatewayToken}`,
@@ -897,18 +942,20 @@ const bulletinToolsPlugin = {
           let body = "";
           res.on("data", (c: string) => (body += c));
           res.on("end", () => {
-            const ok = res.statusCode !== undefined && res.statusCode >= 200 && res.statusCode < 300;
+            let ok = res.statusCode !== undefined && res.statusCode >= 200 && res.statusCode < 300;
             if (ok) {
-              auditLog(`WAKE agent=${agentId} bulletins=${bulletinIds.join(",")} label=${label}`);
-              console.log(`[bulletin-tools] Woke '${agentId}': ${bulletinIds.join(", ")}`);
+              try { ok = JSON.parse(body).ok !== false; } catch {}
+            }
+            if (ok) {
+              console.log(`[bulletin-tools] Woke '${agentId}' via HTTP fallback`);
             } else {
-              console.error(`[bulletin-tools] Wake failed for '${agentId}': ${res.statusCode} ${body}`);
+              console.error(`[bulletin-tools] HTTP wake failed for '${agentId}': ${res.statusCode} ${body}`);
             }
             resolve(ok);
           });
         });
         req.on("error", (e: Error) => {
-          console.error(`[bulletin-tools] Wake error for '${agentId}': ${e.message}`);
+          console.error(`[bulletin-tools] HTTP wake error for '${agentId}': ${e.message}`);
           resolve(false);
         });
         req.write(payload);
@@ -957,6 +1004,31 @@ const bulletinToolsPlugin = {
         );
       }
     });
+
+    // ── Lightweight bootstrap for bulletin sessions ────────────────────
+    // Bulletin wake sessions (agent:*:bulletin:*) don't need full agent
+    // context. Strip bootstrapFiles to keep them lightweight.
+
+    api.registerHook(
+      "agent:bootstrap",
+      async (event: any) => {
+        if (!event.sessionKey?.includes(":bulletin:")) return;
+
+        // Clear all bootstrap files — the task prompt has everything the agent needs
+        if (event.context?.bootstrapFiles) {
+          // Keep only IDENTITY.md or SOUL.md if present (minimal agent identity)
+          event.context.bootstrapFiles = event.context.bootstrapFiles.filter(
+            (f: { name: string }) => f.name === "IDENTITY.md" || f.name === "SOUL.md",
+          );
+        }
+
+        console.log(`[bulletin-tools] Lightweight bootstrap for ${event.sessionKey} (${event.context?.bootstrapFiles?.length ?? 0} files kept)`);
+      },
+      {
+        name: "bulletin-tools.lightweight-bootstrap",
+        description: "Strips bootstrap files for bulletin wake sessions to reduce context",
+      },
+    );
 
     // ── Timeout scheduler for bulletins with timeout_minutes ─────────
 

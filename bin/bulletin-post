@@ -1,0 +1,441 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const https = require('node:https');
+const Database = require('better-sqlite3');
+
+// Discord helper: post a message to a channel, return { ok, messageId }
+function discordPost(channelId, content, token) {
+  return new Promise((resolve) => {
+    const postData = JSON.stringify({ content });
+    const req = https.request({
+      hostname: 'discord.com',
+      path: `/api/v10/channels/${channelId}/messages`,
+      method: 'POST',
+      headers: {
+        Authorization: `Bot ${token}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(postData),
+      },
+    }, (res) => {
+      let body = '';
+      res.on('data', (c) => (body += c));
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          try { resolve({ ok: true, messageId: JSON.parse(body).id }); }
+          catch { resolve({ ok: true, messageId: null }); }
+        } else {
+          resolve({ ok: false, error: `${res.statusCode}: ${body.slice(0, 200)}` });
+        }
+      });
+    });
+    req.on('error', (e) => resolve({ ok: false, error: e.message }));
+    req.write(postData);
+    req.end();
+  });
+}
+
+// Discord helper: create a thread from a message, return threadId or null
+function discordCreateThread(channelId, messageId, name, token) {
+  return new Promise((resolve) => {
+    const threadData = JSON.stringify({ name: name.slice(0, 100), auto_archive_duration: 10080 });
+    const req = https.request({
+      hostname: 'discord.com',
+      path: `/api/v10/channels/${channelId}/messages/${messageId}/threads`,
+      method: 'POST',
+      headers: {
+        Authorization: `Bot ${token}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(threadData),
+      },
+    }, (res) => {
+      let body = '';
+      res.on('data', (c) => (body += c));
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          try { resolve(JSON.parse(body).id || null); }
+          catch { resolve(null); }
+        } else { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.write(threadData);
+    req.end();
+  });
+}
+
+// Resolve ${ENV_VAR} — check process.env first, then .env file
+function resolveEnvRef(ref, envVars) {
+  if (!ref) return undefined;
+  const m = ref.match(/^\$\{([^}]+)\}$/);
+  if (!m) return ref;
+  return process.env[m[1]] || (envVars && envVars[m[1]]);
+}
+
+function loadSecrets() {
+  try {
+    const content = fs.readFileSync(path.join(process.env.HOME || '/home/ubuntu', '.openclaw', '.env'), 'utf8');
+    const vars = {};
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed && !trimmed.startsWith('#') && trimmed.includes('=')) {
+        const idx = trimmed.indexOf('=');
+        vars[trimmed.slice(0, idx)] = trimmed.slice(idx + 1);
+      }
+    }
+    return vars;
+  } catch { return {}; }
+}
+
+function resolveGatewayAuth() {
+  const secrets = loadSecrets();
+  try {
+    const bltCfgPath = path.join(process.env.HOME || '/home/ubuntu', '.openclaw', 'mailroom', 'bulletin-config.json');
+    const bltCfg = JSON.parse(fs.readFileSync(bltCfgPath, 'utf8'));
+    const token = resolveEnvRef(bltCfg.gatewayToken, secrets);
+    if (token) return token;
+  } catch {}
+  return process.env.GATEWAY_AUTH_TOKEN || secrets.GATEWAY_AUTH_TOKEN;
+}
+
+function resolveGatewayPort() {
+  if (process.env.OPENCLAW_GATEWAY_PORT) return parseInt(process.env.OPENCLAW_GATEWAY_PORT, 10) || 18789;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(process.env.HOME || '/home/ubuntu', '.openclaw', 'openclaw.json'), 'utf8'));
+    return cfg.gateway?.port ?? 18789;
+  } catch { return 18789; }
+}
+
+function wakeViaGateway(agentId, task, label) {
+  const http = require('node:http');
+  const port = resolveGatewayPort();
+  const token = resolveGatewayAuth();
+
+  const payload = JSON.stringify({ agentId, task, label: `${label}-${agentId}` });
+
+  return new Promise((resolve) => {
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port,
+      path: '/bulletin/wake',
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      timeout: 20000,
+    }, (res) => {
+      let body = '';
+      res.on('data', (c) => (body += c));
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          try {
+            const parsed = JSON.parse(body);
+            if (parsed.ok) {
+              resolve({ ok: true, output: body });
+            } else {
+              resolve({ ok: false, error: parsed.error?.message || body.slice(0, 200) });
+            }
+          } catch {
+            resolve({ ok: true, output: body });
+          }
+        } else {
+          resolve({ ok: false, error: `HTTP ${res.statusCode}: ${body.slice(0, 200)}` });
+        }
+      });
+    });
+    req.on('error', (e) => resolve({ ok: false, error: e.message }));
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'timeout' }); });
+    req.write(payload);
+    req.end();
+  });
+}
+
+// --- Paths ---
+const HOME = process.env.HOME || '/home/ubuntu';
+const OPENCLAW = path.join(HOME, '.openclaw');
+const BULLETINS_DIR = path.join(OPENCLAW, 'mailroom', 'bulletins');
+const MANIFEST_PATH = path.join(BULLETINS_DIR, 'manifest.json');
+const GROUPS_PATH = path.join(OPENCLAW, 'mailroom', 'agent-groups.json');
+const CONFIG_PATH = path.join(OPENCLAW, 'openclaw.json');
+const LOG_PATH = path.join(OPENCLAW, 'mailroom', 'mailroom.log');
+
+// --- Arg parsing ---
+const args = process.argv.slice(2);
+function getArg(name) {
+  const idx = args.indexOf('--' + name);
+  if (idx === -1) return undefined;
+  return args[idx + 1];
+}
+function hasFlag(name) {
+  return args.includes('--' + name);
+}
+
+const topic = getArg('topic');
+const body = getArg('body');
+const subscribersRaw = getArg('subscribers');
+const urgent = hasFlag('urgent');
+const customId = getArg('id');
+const parentId = getArg('parent');
+const protocol = getArg('protocol');
+const timeout = getArg('timeout');
+const closedNotify = getArg('closed-notify');
+
+if (!topic || !body || !subscribersRaw) {
+  console.error('Usage: bulletin-post --topic "Topic" --body "Body" --subscribers "group1,group2" [--urgent] [--id "custom-id"] [--parent "parent-id"] [--protocol advisory|fyi|consensus|majority] [--timeout minutes] [--closed-notify "channel:ID"]');
+  process.exit(1);
+}
+
+const subscriberGroups = subscribersRaw.split(',').map(s => s.trim()).filter(Boolean);
+
+// --- Resolve subscribers ---
+function resolveSubscribers(groupNames) {
+  // Load agent groups
+  let groups = {};
+  try {
+    const data = JSON.parse(fs.readFileSync(GROUPS_PATH, 'utf8'));
+    groups = data.agentGroups || data;
+  } catch (e) {
+    // No groups file, treat all names as literal agent IDs
+  }
+
+  // Load known agent IDs from openclaw.json
+  let knownAgents = [];
+  try {
+    const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    knownAgents = (config.agents?.list || []).map(a => a.id);
+  } catch (e) {}
+
+  const resolved = new Set();
+
+  for (const name of groupNames) {
+    if (groups[name]) {
+      const members = groups[name];
+      if (members.includes('*')) {
+        // Wildcard = all known agents
+        for (const a of knownAgents) resolved.add(a);
+      } else {
+        for (const m of members) resolved.add(m);
+      }
+    } else if (knownAgents.includes(name)) {
+      // It's a literal agent ID
+      resolved.add(name);
+    } else {
+      // Unknown group/agent, add as-is
+      resolved.add(name);
+    }
+  }
+
+  return Array.from(resolved);
+}
+
+const resolvedSubscribers = resolveSubscribers(subscriberGroups);
+
+const VALID_PROTOCOLS = ['advisory', 'fyi', 'consensus', 'majority'];
+if (protocol && !VALID_PROTOCOLS.includes(protocol)) {
+  console.error(`Error: Invalid protocol "${protocol}". Must be one of: ${VALID_PROTOCOLS.join(', ')}`);
+  process.exit(1);
+}
+
+// --- Validate parent if specified ---
+let resolvedParentId = null;
+if (parentId) {
+  const parentPath = path.join(BULLETINS_DIR, `${parentId}.json`);
+  if (!fs.existsSync(parentPath)) {
+    console.error(`Error: Parent bulletin "${parentId}" not found at ${parentPath}`);
+    process.exit(1);
+  }
+  resolvedParentId = parentId;
+}
+
+// --- Create bulletin ---
+const now = new Date().toISOString();
+let id = customId || `blt-${Date.now()}`;
+if (resolvedParentId && !customId) {
+  // Generate sub-bulletin ID: scan manifest for existing sub-bulletins
+  let manifestData = { bulletins: [] };
+  try {
+    manifestData = JSON.parse(fs.readFileSync(MANIFEST_PATH, 'utf8'));
+    if (!Array.isArray(manifestData.bulletins)) manifestData.bulletins = [];
+  } catch (e) {}
+  const pattern = new RegExp(`^${resolvedParentId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-sub-(\\d+)$`);
+  let maxN = 0;
+  for (const entry of manifestData.bulletins) {
+    const match = entry.id.match(pattern);
+    if (match) {
+      const n = parseInt(match[1], 10);
+      if (n > maxN) maxN = n;
+    }
+  }
+  id = `${resolvedParentId}-sub-${maxN + 1}`;
+}
+
+const readCursors = {};
+for (const agentId of resolvedSubscribers) {
+  readCursors[agentId] = -1;
+}
+
+const bulletin = {
+  id,
+  topic,
+  body,
+  status: 'open',
+  protocol: protocol || 'advisory',
+  round: 'discussion',
+  urgent: urgent || false,
+  subscribers: subscriberGroups,
+  resolvedSubscribers,
+  createdBy: process.env.USER || 'cli',
+  createdAt: now,
+  closedAt: null,
+  responses: [],
+  readCursors,
+  ...(resolvedParentId ? { parentId: resolvedParentId } : {}),
+  ...(closedNotify ? { closedNotify } : {}),
+  ...(timeout ? { timeoutMinutes: parseInt(timeout, 10) } : {}),
+};
+
+// Ensure bulletins dir exists
+fs.mkdirSync(BULLETINS_DIR, { recursive: true });
+
+// Write bulletin file (JSON backup)
+const bulletinPath = path.join(BULLETINS_DIR, `${id}.json`);
+fs.writeFileSync(bulletinPath, JSON.stringify(bulletin, null, 2) + '\n');
+
+// Write bulletin to SQLite DB
+const DB_PATH = path.join(BULLETINS_DIR, 'bulletins.db');
+try {
+  const db = new Database(DB_PATH);
+  db.pragma('journal_mode = WAL');
+  db.pragma('foreign_keys = ON');
+
+  const insertBulletin = db.prepare(`
+    INSERT OR IGNORE INTO bulletins (id, topic, body, status, protocol, round, urgent, created_by, created_at, parent_id, closed_notify, timeout_minutes)
+    VALUES (?, ?, ?, 'open', ?, 'discussion', ?, ?, ?, ?, ?, ?)
+  `);
+  const insertSub = db.prepare(`INSERT OR IGNORE INTO bulletin_subscribers (bulletin_id, agent_id, group_name) VALUES (?, ?, ?)`);
+  const insertCursor = db.prepare(`INSERT OR IGNORE INTO bulletin_cursors (bulletin_id, agent_id, last_seen_response_id) VALUES (?, ?, -1)`);
+  const insertFts = db.prepare(`INSERT INTO bulletins_fts (id, topic, body) VALUES (?, ?, ?)`);
+
+  const txn = db.transaction(() => {
+    insertBulletin.run(id, topic, body, protocol || 'advisory', urgent ? 1 : 0, 'bulletin-post', now, resolvedParentId || null, closedNotify || null, timeout ? parseInt(timeout, 10) : null);
+    const groupName = subscriberGroups.length !== resolvedSubscribers.length ? (subscriberGroups.find(s => !resolvedSubscribers.includes(s)) || null) : null;
+    for (const agentId of resolvedSubscribers) {
+      insertSub.run(id, agentId, groupName);
+      insertCursor.run(id, agentId);
+    }
+    try { insertFts.run(id, topic, body); } catch {}
+  });
+  txn();
+  db.close();
+} catch (e) {
+  console.error('Warning: SQLite write failed:', e.message);
+}
+
+// --- Append to audit log ---
+const logEntry = {
+  ts: now,
+  action: 'bulletin-post',
+  id,
+  topic,
+  resolvedSubscribers,
+  urgent: urgent || false
+};
+fs.appendFileSync(LOG_PATH, JSON.stringify(logEntry) + '\n');
+
+// --- Async: create Discord thread + notify subscribers ---
+(async () => {
+  let threadId = null;
+  try {
+    const bltCfgPath = path.join(OPENCLAW, 'mailroom', 'bulletin-config.json');
+    if (fs.existsSync(bltCfgPath)) {
+      const bltCfg = JSON.parse(fs.readFileSync(bltCfgPath, 'utf8'));
+      const secrets = loadSecrets();
+      const botToken = bltCfg.botToken
+        ? (resolveEnvRef(bltCfg.botToken, secrets) || bltCfg.botToken)
+        : undefined;
+      const boardChannel = bltCfg.bulletinBoardChannel;
+
+      if (botToken && boardChannel) {
+        const threadBody = [
+          `📋 **[${id}] ${topic}**`,
+          `*Protocol: ${protocol || 'advisory'} | Subscribers: ${resolvedSubscribers.join(', ')}*`,
+          '',
+          body,
+          '',
+          '*Respond using `bulletin_respond` tool.*',
+        ].join('\n');
+
+        const postResult = await discordPost(boardChannel, threadBody, botToken);
+        if (postResult.ok && postResult.messageId) {
+          threadId = await discordCreateThread(boardChannel, postResult.messageId, `[${id}] ${topic}`, botToken);
+          if (threadId) {
+            try {
+              const bulletinData = JSON.parse(fs.readFileSync(bulletinPath, 'utf8'));
+              bulletinData.threadId = threadId;
+              fs.writeFileSync(bulletinPath, JSON.stringify(bulletinData, null, 2) + '\n');
+            } catch (e) {
+              console.error('Warning: could not save threadId to bulletin JSON:', e.message);
+            }
+            // Also update SQLite so bulletin_respond can find the threadId
+            // Default closedNotify to the thread if not explicitly set
+            try {
+              const db2 = new Database(DB_PATH);
+              db2.prepare('UPDATE bulletins SET thread_id = ? WHERE id = ?').run(threadId, id);
+              if (!closedNotify) {
+                db2.prepare('UPDATE bulletins SET closed_notify = ? WHERE id = ?').run(`channel:${threadId}`, id);
+              }
+              db2.close();
+            } catch (e) {
+              console.error('Warning: could not save threadId to SQLite:', e.message);
+            }
+          }
+        }
+      }
+
+      const bulletinTask = [
+        `You have 1 pending bulletin requiring your response.`,
+        `Call the \`bulletin_respond\` tool with your assessment.`,
+        `Do nothing else — respond to the bulletin and stop.`,
+        ``,
+        `---`,
+        `## [${id}] ${topic}`,
+        ``,
+        body,
+      ].join('\n');
+      for (const agentId of resolvedSubscribers) {
+        const result = await wakeViaGateway(agentId, bulletinTask, id);
+        if (result.ok) {
+          console.log(`  Woke:        ${agentId}`);
+        } else {
+          console.log(`  Wake fail:   ${agentId} (${result.error})`);
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Warning: Discord notification failed:', e.message);
+  }
+
+  console.log(`Bulletin posted successfully.`);
+  console.log(`  ID:          ${id}`);
+  console.log(`  Topic:       ${topic}`);
+  console.log(`  Urgent:      ${urgent ? 'YES' : 'no'}`);
+  console.log(`  Groups:      ${subscriberGroups.join(', ')}`);
+  console.log(`  Subscribers: ${resolvedSubscribers.join(', ')}`);
+  if (resolvedParentId) {
+    console.log(`  Parent:      ${resolvedParentId}`);
+  }
+  console.log(`  Protocol:    ${protocol || 'advisory'}`);
+  if (timeout) {
+    console.log(`  Timeout:     ${timeout} minutes`);
+  }
+  if (closedNotify) {
+    console.log(`  ClosedNotify:${closedNotify}`);
+  }
+  if (threadId) {
+    console.log(`  Thread:      https://discord.com/channels/767910430537678888/${threadId}`);
+  }
+})();
