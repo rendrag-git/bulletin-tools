@@ -125,6 +125,34 @@ async function notify(
   } catch { /* best effort — never block bulletin operations */ }
 }
 
+function buildCloseSummary(bulletin: ReturnType<typeof loadBulletin>): string {
+  if (!bulletin) return "";
+  const responses = bulletin.responses ?? [];
+  const critiques = bulletin.critiques ?? [];
+  const lines = [
+    `📋 **Bulletin Closed** — [${bulletin.id}] "${bulletin.topic}"`,
+    `**Resolution:** ${bulletin.resolution ?? "unknown"}`,
+    "",
+    `**Discussion (${responses.length} responses):**`,
+    ...responses.map(r => {
+      const pos = r.position === "oppose" ? "⚠️ OPPOSE"
+                : r.position === "partial" ? "~ PARTIAL"
+                : "✅";
+      return `- **${r.agentId}** [${pos}]: ${(r.body ?? "").slice(0, 150)}${(r.body ?? "").length > 150 ? "…" : ""}`;
+    }),
+  ];
+  if (critiques.length > 0) {
+    lines.push("", `**Critiques (${critiques.length}):**`);
+    for (const c of critiques) {
+      const pos = c.position === "oppose" ? "⚠️ OPPOSE"
+                : c.position === "partial" ? "~ PARTIAL"
+                : "🧐";
+      lines.push(`- **${c.agentId}** [${pos}]: ${(c.body ?? "").slice(0, 150)}${(c.body ?? "").length > 150 ? "…" : ""}`);
+    }
+  }
+  return lines.join("\n");
+}
+
 const LOCKS_DIR = join(BULLETINS_DIR, ".locks");
 const LOCK_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -550,6 +578,10 @@ const bulletinToolsPlugin = {
                   const msg = `✅ [${bulletinId}] "${updated.topic ?? bulletinId}" — majority (${alignCount}/${subscribers.length} aligned)`;
                   await notify({ channel: ncfg?.escalationChannel }, msg);
                   await notify({ threadId }, `🏁 **Resolved** — ${msg}`);
+                  if (closed.closedNotify) {
+                    const notifyTarget = closed.closedNotify.replace("channel:", "");
+                    await notify({ channel: notifyTarget }, buildCloseSummary(closed));
+                  }
                 }
               }
             }
@@ -750,6 +782,10 @@ const bulletinToolsPlugin = {
                     { threadId: critiqueThreadId },
                     `🏁 **Resolved** — consensus reached after critique round.`,
                   );
+                  if (closed.closedNotify) {
+                    const notifyTarget = closed.closedNotify.replace("channel:", "");
+                    await notify({ channel: notifyTarget }, buildCloseSummary(closed));
+                  }
                 }
               } else {
                 auditLog(`CONSENSUS_FAIL bulletin=${bulletinId} opposes=${opposeCount} partials=${partialCount}`);
@@ -989,12 +1025,20 @@ const bulletinToolsPlugin = {
           const remaining = deadline - Date.now();
 
           if (remaining <= 0) {
-            dbCloseBulletin(row.id, "stale", `Timed out after ${row.timeout_minutes} minutes`);
+            const closed = dbCloseBulletin(row.id, "stale", `Timed out after ${row.timeout_minutes} minutes`);
+            if (closed?.closedNotify) {
+              const notifyTarget = closed.closedNotify.replace("channel:", "");
+              void notify({ channel: notifyTarget }, buildCloseSummary(closed));
+            }
           } else {
             setTimeout(() => {
               const current = loadBulletin(row.id);
               if (current && current.status === "open") {
-                dbCloseBulletin(row.id, "stale", `Timed out after ${row.timeout_minutes} minutes`);
+                const closed = dbCloseBulletin(row.id, "stale", `Timed out after ${row.timeout_minutes} minutes`);
+                if (closed?.closedNotify) {
+                  const notifyTarget = closed.closedNotify.replace("channel:", "");
+                  void notify({ channel: notifyTarget }, buildCloseSummary(closed));
+                }
               }
             }, remaining);
           }

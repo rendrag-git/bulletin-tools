@@ -73,6 +73,7 @@ export interface Bulletin {
   resolution?: "consensus" | "majority" | "stale" | "manual" | null;
   threadId?: string;
   parentId?: string;
+  closedNotify?: string;
 }
 
 // ── DB Connection ───────────────────────────────────────────────────────────
@@ -330,6 +331,7 @@ export function loadBulletin(bulletinId: string): Bulletin | null {
     resolution: row.resolution as Bulletin["resolution"],
     threadId: row.thread_id as string | undefined,
     parentId: row.parent_id as string | undefined,
+    closedNotify: row.closed_notify as string | undefined,
   };
 }
 
@@ -529,23 +531,7 @@ export function closeBulletin(
       ...(notes ? { notes } : {}),
     });
 
-    // Fire closedNotify callback
-    const notifyRow = db.prepare(`SELECT closed_notify FROM bulletins WHERE id = ?`).get(bulletinId) as { closed_notify: string | null } | undefined;
-    if (notifyRow?.closed_notify) {
-      const channelId = notifyRow.closed_notify.replace("channel:", "");
-      const respCount = getResponseCount(bulletinId, "discussion");
-      const critCount = getResponseCount(bulletinId, "critique");
-      const token = process.env.DISCORD_BOT_TOKEN ?? process.env.DISCORD_BOT_TOKEN_2;
-      if (token) {
-        fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
-          method: "POST",
-          headers: { Authorization: `Bot ${token}`, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            content: `📋 Bulletin \`${bulletinId}\` closed — resolution: **${resolution}**. ${respCount} discussion + ${critCount} critique responses.`,
-          }),
-        }).catch(() => {});
-      }
-    }
+    // closedNotify is handled by the plugin layer (index.ts) after closeBulletin returns
 
     return loadBulletin(bulletinId);
   } catch (err) {
