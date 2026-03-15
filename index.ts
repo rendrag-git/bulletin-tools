@@ -83,6 +83,48 @@ function auditLog(entry: string): void {
   appendFileSync(AUDIT_LOG_PATH, `[${ts}] ${entry}\n`, "utf-8");
 }
 
+// ── Notification choke point ─────────────────────────────────────────────
+// TODO: Replace with OpenClaw message tool when available (issue #5)
+
+interface NotifyConfig {
+  botToken: string;
+  escalationChannel?: string;
+  dissentThreshold?: number;
+}
+
+function loadNotifyConfig(): NotifyConfig | null {
+  try {
+    const cfgPath = join(homedir(), ".openclaw", "mailroom", "bulletin-config.json");
+    if (!existsSync(cfgPath)) return null;
+    const cfg = JSON.parse(readFileSync(cfgPath, "utf-8"));
+    const botToken = resolveConfigToken(cfg.botToken) ?? process.env.RELAY_BOT_TOKEN;
+    if (!botToken) return null;
+    return {
+      botToken,
+      escalationChannel: cfg.escalationChannel,
+      dissentThreshold: cfg.dissentThreshold ?? 2,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function notify(
+  target: { channel?: string; threadId?: string },
+  message: string,
+): Promise<void> {
+  const cfg = loadNotifyConfig();
+  if (!cfg) return;
+  try {
+    if (target.channel) {
+      await postToDiscord(target.channel, message, cfg.botToken);
+    }
+    if (target.threadId) {
+      await postToThread(target.threadId, message, cfg.botToken);
+    }
+  } catch { /* best effort — never block bulletin operations */ }
+}
+
 const LOCKS_DIR = join(BULLETINS_DIR, ".locks");
 const LOCK_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -470,24 +512,14 @@ const bulletinToolsPlugin = {
             // ── Post response to #bulletin-board thread (best-effort) ────────
             const threadId: string | undefined = updated.threadId;
             if (threadId) {
-              try {
-                const cfgPath = join(homedir(), ".openclaw", "mailroom", "bulletin-config.json");
-                if (existsSync(cfgPath)) {
-                  const cfg = JSON.parse(readFileSync(cfgPath, "utf-8"));
-                  const botToken: string | undefined = resolveConfigToken(cfg.botToken) ?? process.env.RELAY_BOT_TOKEN;
-                  if (botToken) {
-                    const posTag = position === "oppose" ? " ⚠️ **[OPPOSE]**"
-                                 : position === "partial" ? ` ~ **[PARTIAL]**`
-                                 : " ✅";
-                    const snippet = response.slice(0, 280);
-                    await postToThread(
-                      threadId,
-                      `${posTag} **${agentId}** responded:\n> ${snippet}${response.length > 280 ? "…" : ""}`,
-                      botToken,
-                    );
-                  }
-                }
-              } catch { /* best effort — never block the response */ }
+              const posTag = position === "oppose" ? " ⚠️ **[OPPOSE]**"
+                           : position === "partial" ? ` ~ **[PARTIAL]**`
+                           : " ✅";
+              const snippet = response.slice(0, 280);
+              await notify(
+                { threadId },
+                `${posTag} **${agentId}** responded:\n> ${snippet}${response.length > 280 ? "…" : ""}`,
+              );
             }
 
             // Note: manifest.json no longer exists — SQL handles indexing.
@@ -514,24 +546,10 @@ const bulletinToolsPlugin = {
                 const closed = dbCloseBulletin(bulletinId, "majority");
                 if (closed) {
                   auditLog(`MAJORITY_CLOSE bulletin=${bulletinId} align=${alignCount}/${subscribers.length}`);
-                  try {
-                    const configPath = join(homedir(), ".openclaw", "mailroom", "bulletin-config.json");
-                    if (existsSync(configPath)) {
-                      const cfg = JSON.parse(readFileSync(configPath, "utf-8"));
-                      const channel = cfg.escalationChannel;
-                      const botToken = resolveConfigToken(cfg.botToken) ?? process.env.RELAY_BOT_TOKEN;
-                      if (botToken) {
-
-                        const msg = `✅ [${bulletinId}] "${updated.topic ?? bulletinId}" — majority (${alignCount}/${subscribers.length} aligned)`;
-                        if (channel) await postToDiscord(channel, msg, botToken);
-                        if (threadId) {
-                          await postToThread(threadId, `🏁 **Resolved** — ${msg}`, botToken);
-                        } else {
-                          console.warn(`[bulletin-tools] No threadId for ${bulletinId} — majority close notice not posted to thread`);
-                        }
-                      }
-                    }
-                  } catch { /* best effort */ }
+                  const ncfg = loadNotifyConfig();
+                  const msg = `✅ [${bulletinId}] "${updated.topic ?? bulletinId}" — majority (${alignCount}/${subscribers.length} aligned)`;
+                  await notify({ channel: ncfg?.escalationChannel }, msg);
+                  await notify({ threadId }, `🏁 **Resolved** — ${msg}`);
                 }
               }
             }
@@ -545,29 +563,18 @@ const bulletinToolsPlugin = {
 
                 // ── Post critique-round notice to thread + re-notify subscribers ─
                 try {
-                  const cfgPath = join(homedir(), ".openclaw", "mailroom", "bulletin-config.json");
-                  if (existsSync(cfgPath)) {
-                    const cfg = JSON.parse(readFileSync(cfgPath, "utf-8"));
-                    const botToken: string | undefined = resolveConfigToken(cfg.botToken) ?? process.env.RELAY_BOT_TOKEN;
-                    if (botToken && threadId) {
-
-                      await postToThread(
-                        threadId,
-                        `🔄 **Critique round open** — all ${subscribers.length} subscribers responded.\nEach subscriber should now review the discussion and submit a critique using \`bulletin_critique\`.`,
-                        botToken,
-                      );
-                    } else if (!threadId) {
-                      console.warn(`[bulletin-tools] No threadId for ${bulletinId} — critique round notice not posted to thread`);
-                    }
-                    // Notify subscribers via their Discord channels
-                    for (const subId of subscribers) {
-                      const latestBulletin = loadBulletin(bulletinId);
-                      const alreadyCritiqued = (latestBulletin?.critiques ?? []).some(
-                        (c: any) => c.agentId === subId,
-                      );
-                      if (!alreadyCritiqued && latestBulletin) {
-                        await wakeAgentViaGateway(subId, [latestBulletin], "critique-round");
-                      }
+                  await notify(
+                    { threadId },
+                    `🔄 **Critique round open** — all ${subscribers.length} subscribers responded.\nEach subscriber should now review the discussion and submit a critique using \`bulletin_critique\`.`,
+                  );
+                  // Notify subscribers via their Discord channels
+                  for (const subId of subscribers) {
+                    const latestBulletin = loadBulletin(bulletinId);
+                    const alreadyCritiqued = (latestBulletin?.critiques ?? []).some(
+                      (c: any) => c.agentId === subId,
+                    );
+                    if (!alreadyCritiqued && latestBulletin) {
+                      await wakeAgentViaGateway(subId, [latestBulletin], "critique-round");
                     }
                   }
                 } catch { /* best effort */ }
@@ -577,55 +584,32 @@ const bulletinToolsPlugin = {
             // ── Dissent escalation ──────────────────────────────
             if (position === "oppose") {
               try {
-                const configPath = join(homedir(), ".openclaw", "mailroom", "bulletin-config.json");
-                if (existsSync(configPath)) {
-                  const config = JSON.parse(readFileSync(configPath, "utf-8"));
-                  const threshold: number = config.dissentThreshold ?? 2;
-                  const channel: string | undefined = config.escalationChannel;
-                  const botToken: string | undefined = resolveConfigToken(config.botToken) ?? process.env.RELAY_BOT_TOKEN;
-
-                  if (botToken) {
-                    // Count unique dissenting agents
-                    const dissenters = new Map<string, string>();
-                    for (const r of updated.responses) {
-                      if ((r as any).position === "oppose" && !dissenters.has(r.agentId)) {
-                        dissenters.set(r.agentId, ((r as any).body ?? "").slice(0, 100));
-                      }
+                const ncfg = loadNotifyConfig();
+                if (ncfg) {
+                  const dissenters = new Map<string, string>();
+                  for (const r of updated.responses) {
+                    if ((r as any).position === "oppose" && !dissenters.has(r.agentId)) {
+                      dissenters.set(r.agentId, ((r as any).body ?? "").slice(0, 100));
                     }
-
-                    if (dissenters.size >= threshold) {
-                      const dissenterList = Array.from(dissenters.entries())
-                        .map(([agent, text]) => `- **${agent}**: "${text}..."`)
-                        .join("\n");
-                      const alertText = [
-                        `⚠️ **Oppose Alert** — Bulletin [${bulletinId}] "${updated.topic ?? bulletinId}"`,
-                        "",
-                        `${dissenters.size} of ${subscribers.length} subscribers have opposed:`,
-                        dissenterList,
-                        "",
-                        `Review in SQLite DB: ~/.openclaw/mailroom/bulletins/bulletins.db`,
-                      ].join("\n");
-
-                      if (channel) {
-                        const result = await postToDiscord(channel, alertText, botToken);
-                        if (result.ok) {
-                          auditLog(`ESCALATE bulletin=${bulletinId} opposes=${dissenters.size} threshold=${threshold}`);
-                        }
-                      }
-                      // Also post to the bulletin thread
-                      if (threadId) {
-                        await postToThread(threadId, alertText, botToken);
-                      } else {
-                        console.warn(`[bulletin-tools] No threadId for ${bulletinId} — dissent alert not posted to thread`);
-                      }
-                    }
+                  }
+                  if (dissenters.size >= (ncfg.dissentThreshold ?? 2)) {
+                    const dissenterList = Array.from(dissenters.entries())
+                      .map(([agent, text]) => `- **${agent}**: "${text}..."`)
+                      .join("\n");
+                    const alertText = [
+                      `⚠️ **Oppose Alert** — Bulletin [${bulletinId}] "${updated.topic ?? bulletinId}"`,
+                      "",
+                      `${dissenters.size} of ${subscribers.length} subscribers have opposed:`,
+                      dissenterList,
+                      "",
+                      `Review in SQLite DB: ~/.openclaw/mailroom/bulletins/bulletins.db`,
+                    ].join("\n");
+                    await notify({ channel: ncfg.escalationChannel, threadId }, alertText);
+                    auditLog(`ESCALATE bulletin=${bulletinId} opposes=${dissenters.size} threshold=${ncfg.dissentThreshold ?? 2}`);
                   }
                 }
               } catch (err) {
-                console.error(
-                  "[bulletin-tools] dissent escalation error:",
-                  err instanceof Error ? err.message : String(err),
-                );
+                console.error("[bulletin-tools] dissent escalation error:", err instanceof Error ? err.message : String(err));
               }
             }
 
@@ -722,25 +706,14 @@ const bulletinToolsPlugin = {
             // ── Post critique to #bulletin-board thread (best-effort) ─────────
             const critiqueThreadId: string | undefined = updated.threadId;
             if (critiqueThreadId) {
-              try {
-                const cfgPath = join(homedir(), ".openclaw", "mailroom", "bulletin-config.json");
-                if (existsSync(cfgPath)) {
-                  const cfg = JSON.parse(readFileSync(cfgPath, "utf-8"));
-                  const botToken: string | undefined = resolveConfigToken(cfg.botToken) ?? process.env.RELAY_BOT_TOKEN;
-                  if (botToken) {
-
-                    const posTag = position === "oppose" ? " ⚠️ **[OPPOSE]**"
-                                 : position === "partial" ? ` ~ **[PARTIAL]**`
-                                 : " 🧐";
-                    const snippet = response.slice(0, 280);
-                    await postToThread(
-                      critiqueThreadId,
-                      `${posTag} **${agentId}** critique:\n> ${snippet}${response.length > 280 ? "…" : ""}`,
-                      botToken,
-                    );
-                  }
-                }
-              } catch { /* best effort */ }
+              const posTag = position === "oppose" ? " ⚠️ **[OPPOSE]**"
+                           : position === "partial" ? ` ~ **[PARTIAL]**`
+                           : " 🧐";
+              const snippet = response.slice(0, 280);
+              await notify(
+                { threadId: critiqueThreadId },
+                `${posTag} **${agentId}** critique:\n> ${snippet}${response.length > 280 ? "…" : ""}`,
+              );
             }
 
             // ── Auto-close check ────────────────────────────────────────────
@@ -768,61 +741,29 @@ const bulletinToolsPlugin = {
                 const closed = dbCloseBulletin(bulletinId, "consensus");
                 if (closed) {
                   auditLog(`CONSENSUS_CLOSE bulletin=${bulletinId}`);
-                  try {
-                    const configPath = join(homedir(), ".openclaw", "mailroom", "bulletin-config.json");
-                    if (existsSync(configPath)) {
-                      const cfg = JSON.parse(readFileSync(configPath, "utf-8"));
-                      const channel = cfg.escalationChannel;
-                      const botToken = resolveConfigToken(cfg.botToken) ?? process.env.RELAY_BOT_TOKEN;
-                      if (botToken) {
-
-                        if (channel) {
-                          await postToDiscord(
-                            channel,
-                            `✅ [${bulletinId}] "${updated.topic ?? bulletinId}" — consensus reached`,
-                            botToken,
-                          );
-                        }
-                        if (critiqueThreadId) {
-                          await postToThread(
-                            critiqueThreadId,
-                            `🏁 **Resolved** — consensus reached after critique round.`,
-                            botToken,
-                          );
-                        } else {
-                          console.warn(`[bulletin-tools] No threadId for ${bulletinId} — consensus close notice not posted to thread`);
-                        }
-                      }
-                    }
-                  } catch { /* best effort */ }
+                  const ncfg = loadNotifyConfig();
+                  await notify(
+                    { channel: ncfg?.escalationChannel },
+                    `✅ [${bulletinId}] "${updated.topic ?? bulletinId}" — consensus reached`,
+                  );
+                  await notify(
+                    { threadId: critiqueThreadId },
+                    `🏁 **Resolved** — consensus reached after critique round.`,
+                  );
                 }
               } else {
                 auditLog(`CONSENSUS_FAIL bulletin=${bulletinId} opposes=${opposeCount} partials=${partialCount}`);
-                try {
-                  const configPath = join(homedir(), ".openclaw", "mailroom", "bulletin-config.json");
-                  if (existsSync(configPath)) {
-                    const cfg = JSON.parse(readFileSync(configPath, "utf-8"));
-                    const channel = cfg.escalationChannel;
-                    const botToken = resolveConfigToken(cfg.botToken) ?? process.env.RELAY_BOT_TOKEN;
-                    if (botToken) {
-                      const failMsg = [
-                        `⚠️ [${bulletinId}] "${updated.topic ?? bulletinId}" — consensus not reached.`,
-                        `Critique complete: ${opposeCount} oppose(s), ${partialCount} partial(s).`,
-                        `Review required before closing.`,
-                      ].join("\n");
-                      if (channel) await postToDiscord(channel, failMsg, botToken);
-                      if (critiqueThreadId) {
-                        await postToThread(
-                          critiqueThreadId,
-                          `⚠️ **Consensus not reached** — ${opposeCount} oppose(s), ${partialCount} partial(s). Human review required.`,
-                          botToken,
-                        );
-                      } else {
-                        console.warn(`[bulletin-tools] No threadId for ${bulletinId} — consensus fail notice not posted to thread`);
-                      }
-                    }
-                  }
-                } catch { /* best effort */ }
+                const ncfg = loadNotifyConfig();
+                const failMsg = [
+                  `⚠️ [${bulletinId}] "${updated.topic ?? bulletinId}" — consensus not reached.`,
+                  `Critique complete: ${opposeCount} oppose(s), ${partialCount} partial(s).`,
+                  `Review required before closing.`,
+                ].join("\n");
+                await notify({ channel: ncfg?.escalationChannel }, failMsg);
+                await notify(
+                  { threadId: critiqueThreadId },
+                  `⚠️ **Consensus not reached** — ${opposeCount} oppose(s), ${partialCount} partial(s). Human review required.`,
+                );
               }
             }
 
