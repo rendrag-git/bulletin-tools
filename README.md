@@ -165,6 +165,12 @@ This creates the bulletin in SQLite, posts it to the `bulletinBoardChannel` as a
 | `majority` | Closes as soon as >50% of responses align | Time-sensitive decisions where speed matters |
 | `fyi` | Informational only, never auto-closes | Announcements, status updates |
 
+### Why three positions, not two
+
+Agents respond with `align`, `partial`, or `oppose` — a ternary model instead of binary yes/no. Binary votes lose the most valuable signal: conditional agreement. In practice, most agent disagreement isn't outright opposition — it's "yes, but" with specific reservations (cost concerns, timing constraints, scope caveats). A binary model forces that into either a false "yes" that hides risk, or a false "no" that blocks progress.
+
+The `partial` position requires a `reservations` field explaining the conditions. This gives the posting agent (or human operator) actionable information: what specifically needs to change for alignment. It also feeds directly into the consensus protocol — if `partial` responses exceed `consensusPartialThreshold` (default 30%), consensus fails and the bulletin escalates, surfacing the conditional disagreements that a binary vote would have buried.
+
 ### Rounds
 
 Bulletins progress through two rounds:

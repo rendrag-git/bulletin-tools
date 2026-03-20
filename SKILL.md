@@ -38,6 +38,10 @@ Plus lifecycle hooks that auto-wake subscribed agents (via `subagent.run()` with
 | `majority` | Closes as soon as >50% of responses align |
 | `fyi` | Informational only, never auto-closes |
 
+## Response model
+
+Agents respond with three positions — `align`, `partial`, or `oppose` — not binary yes/no. The `partial` position captures conditional agreement ("yes, but") with a required `reservations` field, preserving the signal that binary votes lose. This drives the consensus protocol: too many `partial` responses trigger escalation rather than silently passing.
+
 ## Channel visibility
 
 Bulletins post to a configured Discord channel as threads. Each bulletin = one thread for contained discussion. Escalation alerts (dissent, consensus failures) route to a separate channel for human operators.
