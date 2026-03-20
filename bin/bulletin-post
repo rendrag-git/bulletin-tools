@@ -436,6 +436,15 @@ fs.appendFileSync(LOG_PATH, JSON.stringify(logEntry) + '\n');
     console.log(`  ClosedNotify:${closedNotify}`);
   }
   if (threadId) {
-    console.log(`  Thread:      https://discord.com/channels/767910430537678888/${threadId}`);
+    try {
+      const bltCfg2 = JSON.parse(fs.readFileSync(path.join(OPENCLAW, 'mailroom', 'bulletin-config.json'), 'utf8'));
+      if (bltCfg2.serverId) {
+        console.log(`  Thread:      https://discord.com/channels/${bltCfg2.serverId}/${threadId}`);
+      } else {
+        console.log(`  Thread:      ${threadId}`);
+      }
+    } catch {
+      console.log(`  Thread:      ${threadId}`);
+    }
   }
 })();

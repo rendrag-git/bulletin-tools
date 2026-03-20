@@ -35,7 +35,8 @@ All config lives in `~/.openclaw/mailroom/`. You need two files:
   "botToken": "${DISCORD_BOT_TOKEN}",
   "gatewayToken": "${GATEWAY_AUTH_TOKEN}",
   "dissentThreshold": 2,
-  "consensusPartialThreshold": 0.3
+  "consensusPartialThreshold": 0.3,
+  "serverId": "YOUR_DISCORD_SERVER_ID"
 }
 ```
 
@@ -48,6 +49,7 @@ All config lives in `~/.openclaw/mailroom/`. You need two files:
 | `gatewayToken` | string | OpenClaw Gateway auth token (same `${ENV_VAR}` syntax) |
 | `dissentThreshold` | integer | Number of "oppose" responses that trigger an escalation alert (default: `2`) |
 | `consensusPartialThreshold` | float | Fraction of "partial" responses that causes consensus to fail (default: `0.3`) |
+| `serverId` | string | Discord server (guild) ID — used by `bulletin-post` to print clickable thread URLs. Optional; omit to print thread ID only. |
 
 ### `agent-groups.json` — Subscriber groups
 
