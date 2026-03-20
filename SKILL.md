@@ -10,9 +10,11 @@ metadata:
       env:
         - DISCORD_BOT_TOKEN
         - GATEWAY_AUTH_TOKEN
+        - RELAY_BOT_TOKEN
       config:
         - ~/.openclaw/mailroom/bulletin-config.json
         - ~/.openclaw/mailroom/agent-groups.json
+        - ~/.openclaw/secrets.json
     primaryEnv: DISCORD_BOT_TOKEN
     install:
       - kind: node
