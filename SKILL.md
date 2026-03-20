@@ -7,6 +7,10 @@ metadata:
     requires:
       bins:
         - node
+      env:
+        - DISCORD_BOT_TOKEN
+        - GATEWAY_AUTH_TOKEN
+    primaryEnv: DISCORD_BOT_TOKEN
     install:
       - kind: node
         package: better-sqlite3
