@@ -3,7 +3,6 @@ import { readFileSync, mkdirSync, existsSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import * as http from "node:http";
-import { postToDiscord, postToThread } from "./lib/discord-notify.ts";
 import {
   getDb,
   getUnrespondedBulletins,
@@ -18,6 +17,10 @@ import {
   listBulletins,
   searchBulletins,
 } from "./lib/bulletin-db.ts";
+
+// ── Module-level API handle (set in register()) ───────────────────────────────
+
+let _api: OpenClawPluginApi | null = null;
 
 // ── Gateway helpers ──────────────────────────────────────────────────────────
 
@@ -61,11 +64,12 @@ function auditLog(entry: string): void {
   appendFileSync(AUDIT_LOG_PATH, `[${ts}] ${entry}\n`, "utf-8");
 }
 
-// ── Notification choke point ─────────────────────────────────────────────
-// TODO: Replace with OpenClaw message tool when available (issue #5)
+// ── Notification choke point ──────────────────────────────────────────────────
 
 interface NotifyConfig {
-  botToken: string;
+  platform: string;
+  botToken?: string;
+  accountId?: string;
   escalationChannel?: string;
   dissentThreshold?: number;
 }
@@ -75,10 +79,14 @@ function loadNotifyConfig(): NotifyConfig | null {
     const cfgPath = join(homedir(), ".openclaw", "mailroom", "bulletin-config.json");
     if (!existsSync(cfgPath)) return null;
     const cfg = JSON.parse(readFileSync(cfgPath, "utf-8"));
+    const platform: string = cfg.platform ?? "discord";
     const botToken = resolveConfigToken(cfg.botToken) ?? process.env.RELAY_BOT_TOKEN;
-    if (!botToken) return null;
+    const needsToken = ["discord", "slack", "telegram"].includes(platform);
+    if (needsToken && !botToken) return null;
     return {
+      platform,
       botToken,
+      accountId: cfg.accountId,
       escalationChannel: cfg.escalationChannel,
       dissentThreshold: cfg.dissentThreshold ?? 2,
     };
@@ -87,18 +95,86 @@ function loadNotifyConfig(): NotifyConfig | null {
   }
 }
 
+async function sendToChannel(
+  platform: string,
+  channel: string,
+  text: string,
+  cfg: NotifyConfig,
+): Promise<void> {
+  if (!_api) return;
+  const ch = (_api.runtime as any).channel;
+  const opts = { token: cfg.botToken, accountId: cfg.accountId };
+  switch (platform) {
+    case "discord":
+      await ch.discord.sendMessageDiscord(`channel:${channel}`, text, opts);
+      break;
+    case "slack":
+      await ch.slack.sendMessageSlack(channel, text, opts);
+      break;
+    case "telegram":
+      await ch.telegram.sendMessageTelegram(channel, text, opts);
+      break;
+    case "signal":
+      await ch.signal.sendMessageSignal(channel, text, { accountId: cfg.accountId });
+      break;
+    case "imessage":
+      await ch.imessage.sendMessageIMessage(channel, text, { accountId: cfg.accountId });
+      break;
+    case "whatsapp":
+      await ch.whatsapp.sendMessageWhatsApp(channel, text, { accountId: cfg.accountId });
+      break;
+    default:
+      console.warn(`[bulletin-tools] unknown platform: ${platform}`);
+  }
+}
+
+async function sendToThread(
+  platform: string,
+  threadId: string,
+  channel: string | undefined,
+  text: string,
+  cfg: NotifyConfig,
+): Promise<void> {
+  if (!_api) return;
+  const ch = (_api.runtime as any).channel;
+  const opts = { token: cfg.botToken, accountId: cfg.accountId };
+  switch (platform) {
+    case "discord":
+      await ch.discord.sendMessageDiscord(`channel:${threadId}`, text, opts);
+      break;
+    case "slack":
+      if (channel) {
+        await ch.slack.sendMessageSlack(channel, text, { ...opts, threadTs: threadId });
+      }
+      break;
+    case "telegram":
+      if (channel) {
+        const tid = parseInt(threadId, 10);
+        await ch.telegram.sendMessageTelegram(channel, text, { ...opts, messageThreadId: isNaN(tid) ? undefined : tid });
+      }
+      break;
+    default:
+      // Signal/iMessage/WhatsApp have no thread model — fall back to channel
+      if (channel) {
+        await sendToChannel(platform, channel, text, cfg);
+      }
+  }
+}
+
 async function notify(
   target: { channel?: string; threadId?: string },
   message: string,
 ): Promise<void> {
+  if (!_api) return;
   const cfg = loadNotifyConfig();
   if (!cfg) return;
+  const platform = cfg.platform;
   try {
     if (target.channel) {
-      await postToDiscord(target.channel, message, cfg.botToken);
+      await sendToChannel(platform, target.channel, message, cfg);
     }
     if (target.threadId) {
-      await postToThread(target.threadId, message, cfg.botToken);
+      await sendToThread(platform, target.threadId, target.channel, message, cfg);
     }
   } catch { /* best effort — never block bulletin operations */ }
 }
@@ -287,6 +363,7 @@ const bulletinToolsPlugin = {
     properties: {},
   },
   register(api: OpenClawPluginApi) {
+    _api = api;
     api.registerTool(
       (ctx) => {
         const agentId =
