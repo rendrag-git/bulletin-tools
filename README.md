@@ -267,17 +267,24 @@ Keep this channel visible to human operators. It's the "something needs attentio
 
 ## Platform Support
 
-The config schema supports `platform` values for `discord`, `slack`, `telegram`, `signal`, `imessage`, and `whatsapp`. The routing code (`sendToChannel`, `sendToThread`) has switch branches for each platform.
-
-**Currently implemented and tested: Discord only.**
-
-Slack and Telegram have thread-aware routing stubs (using `threadTs` and `messageThreadId` respectively). Signal, iMessage, and WhatsApp fall back to flat channel messages since they have no thread model.
-
-If you need a non-Discord platform, contributions are welcome — the `sendToChannel` / `sendToThread` functions in `index.ts` are the integration points.
+Discord is the only implemented and tested notification platform. Set `"platform": "discord"` in `bulletin-config.json`; non-Discord platform values are ignored by the plugin.
 
 ## Agent Waking
 
 When a bulletin is posted inside the plugin runtime, subscribed agents are automatically woken to respond. The primary wake mechanism is `subagent.run()` (in-process agent turns with no WS handshake). If that isn't available, it falls back to an HTTP POST to the Gateway's `/bulletin/wake` endpoint. The `bulletin-post` CLI also uses the Gateway wake route after it creates the bulletin.
+
+The wake route accepts bulletin IDs, not arbitrary task text. The plugin loads each bulletin locally, verifies the target agent is subscribed, then builds the wake prompt itself.
+
+## Security and Data Handling
+
+Bulletin content is operational data. Topics, bodies, responses, critiques, escalation summaries, and closure summaries may be stored locally and sent to configured Discord channels.
+
+- **Local retention:** bulletin records and responses are persisted under `$OPENCLAW_HOME/mailroom/bulletins/` until you delete or archive them.
+- **External transmission:** Discord notifications send bulletin content to Discord using your configured bot token and channel IDs.
+- **Automatic execution:** creating a bulletin can wake every resolved subscriber agent. Keep `agent-groups.json` narrow and review group membership.
+- **Credentials:** treat `DISCORD_BOT_TOKEN`, `RELAY_BOT_TOKEN`, `GATEWAY_AUTH_TOKEN`, and `$OPENCLAW_HOME/secrets.json` as sensitive. Use least-privilege tokens and restrict Gateway access.
+- **Sensitive content:** do not put secrets, customer data, credentials, or private legal/HR/finance details in bulletin text unless your OpenClaw home and Discord channels are approved for that data.
+- **Visibility:** `bulletin_list` only returns bulletins where the caller is the creator or a resolved subscriber. Discord channel visibility is still controlled by Discord permissions.
 
 ## Data
 

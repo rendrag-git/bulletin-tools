@@ -108,11 +108,15 @@ function resolveGatewayPort() {
   } catch { return 18789; }
 }
 
-function wakeViaGateway(agentId, task, label) {
+function wakeViaGateway(agentId, bulletinId, label) {
   const port = resolveGatewayPort();
   const token = resolveGatewayAuth();
 
-  const payload = JSON.stringify({ agentId, task, label: `${label}-${agentId}` });
+  const payload = JSON.stringify({
+    agentId,
+    bulletinIds: [bulletinId],
+    label: `${label}-${agentId}`,
+  });
 
   return new Promise((resolve) => {
     const req = http.request({
@@ -323,18 +327,8 @@ fs.appendFileSync(LOG_PATH, JSON.stringify(logEntry) + '\n');
         }
       }
 
-      const bulletinTask = [
-        `You have 1 pending bulletin requiring your response.`,
-        `Call the \`bulletin_respond\` tool with your assessment.`,
-        `Do nothing else — respond to the bulletin and stop.`,
-        ``,
-        `---`,
-        `## [${id}] ${topic}`,
-        ``,
-        body,
-      ].join('\n');
       for (const agentId of resolvedSubscribers) {
-        const result = await wakeViaGateway(agentId, bulletinTask, id);
+        const result = await wakeViaGateway(agentId, id, id);
         if (result.ok) {
           console.log(`  Woke:        ${agentId}`);
         } else {

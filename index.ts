@@ -50,7 +50,7 @@ function auditLog(entry: string): void {
 // ── Notification choke point ──────────────────────────────────────────────────
 
 interface NotifyConfig {
-  platform: string;
+  platform: "discord";
   botToken?: string;
   accountId?: string;
   bulletinBoardChannel?: string;
@@ -65,9 +65,12 @@ function loadNotifyConfig(): NotifyConfig | null {
     const cfg = loadBulletinConfig();
     if (!cfg) return null;
     const platform: string = cfg.platform ?? "discord";
+    if (platform !== "discord") {
+      console.warn(`[bulletin-tools] unsupported notification platform: ${platform}`);
+      return null;
+    }
     const botToken = resolveConfigToken(cfg.botToken) ?? process.env.RELAY_BOT_TOKEN;
-    const needsToken = ["discord", "slack", "telegram"].includes(platform);
-    if (needsToken && !botToken) return null;
+    if (!botToken) return null;
     return {
       platform,
       botToken,
@@ -82,7 +85,7 @@ function loadNotifyConfig(): NotifyConfig | null {
 }
 
 async function sendToChannel(
-  platform: string,
+  platform: "discord",
   channel: string,
   text: string,
   cfg: NotifyConfig,
@@ -94,28 +97,11 @@ async function sendToChannel(
     case "discord":
       await ch.discord.sendMessageDiscord(`channel:${channel}`, text, opts);
       break;
-    case "slack":
-      await ch.slack.sendMessageSlack(channel, text, opts);
-      break;
-    case "telegram":
-      await ch.telegram.sendMessageTelegram(channel, text, opts);
-      break;
-    case "signal":
-      await ch.signal.sendMessageSignal(channel, text, { accountId: cfg.accountId });
-      break;
-    case "imessage":
-      await ch.imessage.sendMessageIMessage(channel, text, { accountId: cfg.accountId });
-      break;
-    case "whatsapp":
-      await ch.whatsapp.sendMessageWhatsApp(channel, text, { accountId: cfg.accountId });
-      break;
-    default:
-      console.warn(`[bulletin-tools] unknown platform: ${platform}`);
   }
 }
 
 async function sendToThread(
-  platform: string,
+  platform: "discord",
   threadId: string,
   channel: string | undefined,
   text: string,
@@ -128,22 +114,6 @@ async function sendToThread(
     case "discord":
       await ch.discord.sendMessageDiscord(`channel:${threadId}`, text, opts);
       break;
-    case "slack":
-      if (channel) {
-        await ch.slack.sendMessageSlack(channel, text, { ...opts, threadTs: threadId });
-      }
-      break;
-    case "telegram":
-      if (channel) {
-        const tid = parseInt(threadId, 10);
-        await ch.telegram.sendMessageTelegram(channel, text, { ...opts, messageThreadId: isNaN(tid) ? undefined : tid });
-      }
-      break;
-    default:
-      // Signal/iMessage/WhatsApp have no thread model — fall back to channel
-      if (channel) {
-        await sendToChannel(platform, channel, text, cfg);
-      }
   }
 }
 
@@ -336,6 +306,14 @@ function formatBulletinSummary(
     responseCount: b.responses?.length ?? 0,
     subscribers: b.resolvedSubscribers,
   };
+}
+
+function canAgentReadBulletin(
+  bulletin: ReturnType<typeof loadBulletin>,
+  agentId: string,
+): boolean {
+  if (!bulletin || !agentId || agentId === "unknown") return false;
+  return bulletin.createdBy === agentId || bulletin.resolvedSubscribers.includes(agentId);
 }
 
 const VALID_PROTOCOLS = ["advisory", "fyi", "consensus", "majority"] as const;
@@ -1044,6 +1022,12 @@ const bulletinToolsPlugin = {
                   message: `Bulletin ${params.bulletinId} not found.`,
                 };
               }
+              if (!canAgentReadBulletin(bulletin, agentId)) {
+                return {
+                  status: "error",
+                  message: `Bulletin ${params.bulletinId} is not visible to ${agentId}.`,
+                };
+              }
               return {
                 status: "ok",
                 count: 1,
@@ -1053,7 +1037,8 @@ const bulletinToolsPlugin = {
 
             // Full-text search
             if (params.search) {
-              const results = searchBulletins(params.search, limit);
+              const results = searchBulletins(params.search, limit)
+                .filter((b) => canAgentReadBulletin(b, agentId));
               return {
                 status: "ok",
                 count: results.length,
@@ -1100,15 +1085,38 @@ const bulletinToolsPlugin = {
 
     const subagent = (api.runtime as any).subagent;
 
+    function normalizeWakeBulletinIds(params: any): string[] {
+      const raw =
+        Array.isArray(params?.bulletinIds) ? params.bulletinIds
+        : typeof params?.bulletinId === "string" ? [params.bulletinId]
+        : [];
+      return raw
+        .filter((entry: unknown): entry is string => typeof entry === "string")
+        .map((entry) => entry.trim())
+        .filter(Boolean)
+        .slice(0, 20);
+    }
+
     async function doBulletinWake(
       agentId: string,
-      task: string,
+      bulletins: Array<{ id: string; topic: string; body: string; responses: any[]; resolvedSubscribers: string[] }>,
       label: string,
     ): Promise<{ ok: true; payload: any } | { ok: false; error: { code: string; message: string } }> {
-      if (!agentId || !task || !label) {
-        return { ok: false, error: { code: "INVALID_PARAMS", message: "agentId, task, and label are required" } };
+      if (!agentId || !label || !Array.isArray(bulletins) || bulletins.length === 0) {
+        return { ok: false, error: { code: "INVALID_PARAMS", message: "agentId, bulletinIds, and label are required" } };
+      }
+      const unauthorized = bulletins.find((bulletin) => !bulletin.resolvedSubscribers.includes(agentId));
+      if (unauthorized) {
+        return {
+          ok: false,
+          error: {
+            code: "FORBIDDEN",
+            message: `Agent ${agentId} is not subscribed to bulletin ${unauthorized.id}`,
+          },
+        };
       }
 
+      const task = buildBulletinTaskPrompt(bulletins);
       const sessionKey = `agent:${agentId}:bulletin:${label}`;
 
       try {
@@ -1130,9 +1138,24 @@ const bulletinToolsPlugin = {
 
     // ── Gateway method: bulletin_wake (WS) — kept for compatibility ─────
     api.registerGatewayMethod("bulletin_wake", async ({ params, respond }) => {
+      const bulletinIds = normalizeWakeBulletinIds(params);
+      const bulletins = bulletinIds.map((id) => loadBulletin(id)).filter(Boolean) as Array<{
+        id: string;
+        topic: string;
+        body: string;
+        responses: any[];
+        resolvedSubscribers: string[];
+      }>;
+      if (bulletins.length !== bulletinIds.length) {
+        respond(false, undefined, {
+          code: "NOT_FOUND",
+          message: "One or more bulletinIds were not found",
+        });
+        return;
+      }
       const result = await doBulletinWake(
         params.agentId as string,
-        params.task as string,
+        bulletins,
         params.label as string,
       );
       if (result.ok) {
@@ -1170,7 +1193,22 @@ const bulletinToolsPlugin = {
           return true;
         }
 
-        const result = await doBulletinWake(params.agentId, params.task, params.label);
+        const bulletinIds = normalizeWakeBulletinIds(params);
+        const bulletins = bulletinIds.map((id) => loadBulletin(id)).filter(Boolean) as Array<{
+          id: string;
+          topic: string;
+          body: string;
+          responses: any[];
+          resolvedSubscribers: string[];
+        }>;
+        if (bulletins.length !== bulletinIds.length) {
+          res.statusCode = 404;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ ok: false, error: { code: "NOT_FOUND", message: "One or more bulletinIds were not found" } }));
+          return true;
+        }
+
+        const result = await doBulletinWake(params.agentId, bulletins, params.label);
 
         res.statusCode = result.ok ? 200 : 400;
         res.setHeader("Content-Type", "application/json");
@@ -1188,12 +1226,11 @@ const bulletinToolsPlugin = {
       bulletins: Array<{ id: string; topic: string; body: string; responses: any[]; resolvedSubscribers: string[] }>,
       label: string,
     ): Promise<boolean> {
-      const task = buildBulletinTaskPrompt(bulletins);
       const bulletinIds = bulletins.map(b => b.id);
       const jobLabel = `${bulletinIds.join("-")}-${agentId}-${label}`;
 
       // Try direct path first
-      const result = await doBulletinWake(agentId, task, jobLabel);
+      const result = await doBulletinWake(agentId, bulletins, jobLabel);
       if (result.ok) {
         auditLog(`WAKE agent=${agentId} bulletins=${bulletinIds.join(",")} label=${label}`);
         console.log(`[bulletin-tools] Woke '${agentId}': ${bulletinIds.join(", ")}`);
@@ -1204,7 +1241,7 @@ const bulletinToolsPlugin = {
       // fall back to HTTP self-call to /bulletin/wake
       if ("error" in result && result.error.message.includes("gateway request")) {
         console.log(`[bulletin-tools] Falling back to HTTP wake for '${agentId}'`);
-        return wakeViaHttp(agentId, task, jobLabel);
+        return wakeViaHttp(agentId, bulletinIds, jobLabel);
       }
 
       console.error(`[bulletin-tools] Wake failed for '${agentId}': ${"error" in result ? result.error.message : "unknown error"}`);
@@ -1212,7 +1249,7 @@ const bulletinToolsPlugin = {
     }
 
     // HTTP fallback for waking agents when subagent.run isn't available
-    async function wakeViaHttp(agentId: string, task: string, label: string): Promise<boolean> {
+    async function wakeViaHttp(agentId: string, bulletinIds: string[], label: string): Promise<boolean> {
       const gatewayToken = (() => {
         try {
           const cfg = loadBulletinConfig();
@@ -1237,7 +1274,7 @@ const bulletinToolsPlugin = {
         } catch { return 18789; }
       })();
 
-      const payload = JSON.stringify({ agentId, task, label });
+      const payload = JSON.stringify({ agentId, bulletinIds, label });
 
       return new Promise((resolve) => {
         const req = http.request({
