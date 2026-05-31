@@ -62,7 +62,7 @@ Requires Node.js 22.18.0 or newer. Source-tree CLI wrappers import the repo's `.
 **Via ClawHub:**
 
 ```bash
-openclaw plugins install clawhub:bulletin-tools
+openclaw plugins install clawhub:bulletin-tools-plugin
 ```
 
 **Manual (local plugin):**
