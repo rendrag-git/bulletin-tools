@@ -1,13 +1,22 @@
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { readFileSync, mkdirSync, existsSync, appendFileSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
 import * as http from "node:http";
+import {
+  loadBulletinConfig,
+  resolveConfigToken,
+} from "./lib/config.ts";
+import {
+  getBulletinAuditLogPath,
+  getBulletinConfigPath,
+  getBulletinDbPath,
+  getBulletinsDir,
+  getOpenClawConfigPath,
+} from "./lib/paths.ts";
 import {
   getDb,
   getUnrespondedBulletins,
   loadBulletin,
   addResponse,
+  createBulletin,
   saveBulletin,
   closeBulletin as dbCloseBulletin,
   transitionToRound,
@@ -17,44 +26,18 @@ import {
   listBulletins,
   searchBulletins,
 } from "./lib/bulletin-db.ts";
+import {
+  resolveBulletinSubscribers,
+} from "./lib/subscribers.ts";
+
+type OpenClawPluginApi = any;
 
 // ── Module-level API handle (set in register()) ───────────────────────────────
 
 let _api: OpenClawPluginApi | null = null;
 
-// ── Gateway helpers ──────────────────────────────────────────────────────────
-
-let _secrets: Record<string, string> | null = null;
-
-function loadSecrets(): Record<string, string> {
-  if (_secrets) return _secrets;
-  try {
-    _secrets = JSON.parse(
-      readFileSync(join(homedir(), ".openclaw", "secrets.json"), "utf-8"),
-    ) as Record<string, string>;
-  } catch {
-    _secrets = {};
-  }
-  return _secrets;
-}
-
-/**
- * Resolve a bot token from bulletin-config.json.
- * Handles literal tokens and ${ENV_VAR} references (via process.env + secrets.json).
- */
-function resolveConfigToken(rawToken: string | undefined): string | undefined {
-  if (!rawToken) return undefined;
-  const match = rawToken.match(/^\$\{([^}]+)\}$/);
-  if (match) {
-    const varName = match[1];
-    return process.env[varName] ?? loadSecrets()[varName];
-  }
-  return rawToken;
-}
-
-
-const BULLETINS_DIR = join(homedir(), ".openclaw", "mailroom", "bulletins");
-const AUDIT_LOG_PATH = join(BULLETINS_DIR, "audit.log");
+const BULLETINS_DIR = getBulletinsDir();
+const AUDIT_LOG_PATH = getBulletinAuditLogPath();
 
 function auditLog(entry: string): void {
   if (!existsSync(BULLETINS_DIR)) {
@@ -70,15 +53,17 @@ interface NotifyConfig {
   platform: string;
   botToken?: string;
   accountId?: string;
+  bulletinBoardChannel?: string;
   escalationChannel?: string;
   dissentThreshold?: number;
 }
 
 function loadNotifyConfig(): NotifyConfig | null {
   try {
-    const cfgPath = join(homedir(), ".openclaw", "mailroom", "bulletin-config.json");
+    const cfgPath = getBulletinConfigPath();
     if (!existsSync(cfgPath)) return null;
-    const cfg = JSON.parse(readFileSync(cfgPath, "utf-8"));
+    const cfg = loadBulletinConfig();
+    if (!cfg) return null;
     const platform: string = cfg.platform ?? "discord";
     const botToken = resolveConfigToken(cfg.botToken) ?? process.env.RELAY_BOT_TOKEN;
     const needsToken = ["discord", "slack", "telegram"].includes(platform);
@@ -87,6 +72,7 @@ function loadNotifyConfig(): NotifyConfig | null {
       platform,
       botToken,
       accountId: cfg.accountId,
+      bulletinBoardChannel: cfg.bulletinBoardChannel,
       escalationChannel: cfg.escalationChannel,
       dissentThreshold: cfg.dissentThreshold ?? 2,
     };
@@ -352,10 +338,41 @@ function formatBulletinSummary(
   };
 }
 
+const VALID_PROTOCOLS = ["advisory", "fyi", "consensus", "majority"] as const;
+type BulletinProtocol = (typeof VALID_PROTOCOLS)[number];
+
+function isBulletinProtocol(value: string): value is BulletinProtocol {
+  return (VALID_PROTOCOLS as readonly string[]).includes(value);
+}
+
+function normalizeSubscriberInput(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value
+      .filter((entry): entry is string => typeof entry === "string")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+  }
+  if (typeof value === "string") {
+    return value.split(",").map((entry) => entry.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function normalizeBulletinId(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 80) return null;
+  return /^[a-zA-Z0-9._:-]+$/.test(trimmed) ? trimmed : null;
+}
+
+function generatedBulletinId(agentId: string): string {
+  const safeAgentId = agentId.replace(/[^a-zA-Z0-9._:-]/g, "-").slice(0, 40) || "agent";
+  return normalizeBulletinId(`blt-${safeAgentId}-${Date.now()}`) ?? `blt-${Date.now()}`;
+}
+
 const bulletinToolsPlugin = {
   id: "bulletin-tools",
   name: "Bulletin Board Tools",
-  description: "Provides bulletin_respond tool for agents to respond to bulletins",
+  description: "Provides bulletin tools for agents to post, respond to, and review bulletins",
   kind: "tools",
   configSchema: {
     type: "object" as const,
@@ -364,6 +381,224 @@ const bulletinToolsPlugin = {
   },
   register(api: OpenClawPluginApi) {
     _api = api;
+    api.registerTool(
+      (ctx) => {
+        const agentId =
+          ctx.sessionKey?.match(/^agent:([^:]+)/)?.[1] ?? "unknown";
+
+        return {
+          name: "bulletin_post",
+          label: "Post Bulletin",
+          description:
+            "Create a structured decision/input bulletin for other subscribed agents. Use this for multi-agent deliberation, not for posting claimable work items.",
+          parameters: {
+            type: "object" as const,
+            required: ["topic", "body", "subscribers"],
+            additionalProperties: false,
+            properties: {
+              id: {
+                type: "string" as const,
+                description: "Optional stable bulletin ID. Allowed characters: letters, numbers, dot, underscore, colon, and dash.",
+              },
+              topic: {
+                type: "string" as const,
+                description: "Short decision or question the agents should evaluate.",
+              },
+              body: {
+                type: "string" as const,
+                description: "Context, options, constraints, and the input requested from subscribers.",
+              },
+              subscribers: {
+                type: "array" as const,
+                items: { type: "string" as const },
+                description: "Known agent IDs or group names from agent-groups.json.",
+              },
+              protocol: {
+                type: "string" as const,
+                enum: VALID_PROTOCOLS,
+                description: "advisory, fyi, consensus, or majority. Defaults to advisory.",
+              },
+              urgent: {
+                type: "boolean" as const,
+                description: "Marks the bulletin urgent. Subscribers are woken immediately either way.",
+              },
+              parentId: {
+                type: "string" as const,
+                description: "Optional parent bulletin ID for follow-up bulletins.",
+              },
+              timeoutMinutes: {
+                type: "number" as const,
+                description: "Optional auto-close timeout in minutes.",
+              },
+              closedNotify: {
+                type: "string" as const,
+                description: "Optional closure route, for example channel:1234567890.",
+              },
+              allowSelfOnly: {
+                type: "boolean" as const,
+                description: "Allow creating a bulletin where the posting agent is the only subscriber. Defaults to false.",
+              },
+            },
+          },
+
+          async execute(
+            _toolCallId: string,
+            params: {
+              id?: string;
+              topic: string;
+              body: string;
+              subscribers: string[];
+              protocol?: BulletinProtocol;
+              urgent?: boolean;
+              parentId?: string;
+              timeoutMinutes?: number;
+              closedNotify?: string;
+              allowSelfOnly?: boolean;
+            },
+          ) {
+            const topic = typeof params.topic === "string" ? params.topic.trim() : "";
+            const body = typeof params.body === "string" ? params.body.trim() : "";
+            if (!topic || topic.length > 200) {
+              return {
+                status: "error",
+                message: "topic is required and must be 200 characters or fewer.",
+              };
+            }
+            if (!body || body.length > 8000) {
+              return {
+                status: "error",
+                message: "body is required and must be 8000 characters or fewer.",
+              };
+            }
+
+            const requestedSubscribers = normalizeSubscriberInput(params.subscribers);
+            if (requestedSubscribers.length === 0 || requestedSubscribers.length > 50) {
+              return {
+                status: "error",
+                message: "subscribers must contain between 1 and 50 known group or agent IDs.",
+              };
+            }
+
+            const protocol = params.protocol ?? "advisory";
+            if (!isBulletinProtocol(protocol)) {
+              return {
+                status: "error",
+                message: `Invalid protocol "${protocol}". Must be one of: ${VALID_PROTOCOLS.join(", ")}.`,
+              };
+            }
+
+            const resolution = resolveBulletinSubscribers(requestedSubscribers, { allowUnknown: false });
+            if (resolution.unknown.length > 0) {
+              return {
+                status: "error",
+                message: `Unknown subscriber group or agent ID: ${resolution.unknown.join(", ")}`,
+                knownGroups: Object.keys(resolution.groups),
+                knownAgents: resolution.knownAgents,
+              };
+            }
+            if (resolution.resolved.length === 0) {
+              return {
+                status: "error",
+                message: "No subscribers resolved. Check agent-groups.json and openclaw.json.",
+              };
+            }
+            if (
+              params.allowSelfOnly !== true &&
+              resolution.resolved.length === 1 &&
+              resolution.resolved[0] === agentId
+            ) {
+              return {
+                status: "error",
+                message: "Refusing to create a self-only bulletin. Add another subscriber or set allowSelfOnly.",
+              };
+            }
+
+            const parentId = typeof params.parentId === "string" && params.parentId.trim()
+              ? params.parentId.trim()
+              : undefined;
+            if (parentId && !loadBulletin(parentId)) {
+              return {
+                status: "error",
+                message: `Parent bulletin "${parentId}" not found.`,
+              };
+            }
+
+            const timeoutMinutes = typeof params.timeoutMinutes === "number"
+              ? Math.trunc(params.timeoutMinutes)
+              : undefined;
+            if (timeoutMinutes !== undefined && (timeoutMinutes <= 0 || timeoutMinutes > 10080)) {
+              return {
+                status: "error",
+                message: "timeoutMinutes must be between 1 and 10080.",
+              };
+            }
+
+            const bulletinId = params.id
+              ? normalizeBulletinId(params.id)
+              : generatedBulletinId(agentId);
+            if (!bulletinId) {
+              return {
+                status: "error",
+                message: "id must be 1-80 characters and contain only letters, numbers, dot, underscore, colon, and dash.",
+              };
+            }
+
+            const created = createBulletin({
+              id: bulletinId,
+              topic,
+              body,
+              urgent: params.urgent === true,
+              subscribers: resolution.requested,
+              resolvedSubscribers: resolution.resolved,
+              createdBy: agentId,
+              protocol,
+              parentId,
+              closedNotify: typeof params.closedNotify === "string" && params.closedNotify.trim()
+                ? params.closedNotify.trim()
+                : undefined,
+              timeoutMinutes,
+            });
+            if (!created) {
+              return {
+                status: "error",
+                message: `Failed to create bulletin ${bulletinId}. It may already exist.`,
+              };
+            }
+
+            auditLog(`CREATE bulletin=${bulletinId} agent=${agentId} subscribers=${resolution.resolved.join(",")} protocol=${protocol}`);
+
+            const cfg = loadNotifyConfig();
+            if (cfg?.bulletinBoardChannel) {
+              await notify(
+                { channel: cfg.bulletinBoardChannel },
+                [
+                  `📋 **[${bulletinId}] ${topic}**`,
+                  `*Created by: ${agentId} | Protocol: ${protocol} | Subscribers: ${resolution.resolved.join(", ")}*`,
+                  "",
+                  body.slice(0, 1800),
+                  body.length > 1800 ? "\n…" : "",
+                ].join("\n"),
+              );
+            }
+
+            for (const subId of resolution.resolved) {
+              await wakeBulletinSubscriber(subId, [created], "agent-created");
+            }
+
+            return {
+              status: "ok",
+              message: `Bulletin ${bulletinId} created and ${resolution.resolved.length} subscriber(s) notified.`,
+              bulletinId,
+              protocol,
+              subscribers: resolution.resolved,
+              createdBy: agentId,
+            };
+          },
+        };
+      },
+      { names: ["bulletin_post"] },
+    );
+
     api.registerTool(
       (ctx) => {
         const agentId =
@@ -565,7 +800,7 @@ const bulletinToolsPlugin = {
                       `${dissenters.size} of ${subscribers.length} subscribers have opposed:`,
                       dissenterList,
                       "",
-                      `Review in SQLite DB: ~/.openclaw/mailroom/bulletins/bulletins.db`,
+                      `Review in SQLite DB: ${getBulletinDbPath()}`,
                     ].join("\n");
                     await notify({ channel: ncfg.escalationChannel, threadId }, alertText);
                     auditLog(`ESCALATE bulletin=${bulletinId} opposes=${dissenters.size} threshold=${ncfg.dissentThreshold ?? 2}`);
@@ -691,7 +926,7 @@ const bulletinToolsPlugin = {
               const partialThreshold = (() => {
                 try {
                   const cfg = JSON.parse(readFileSync(
-                    join(homedir(), ".openclaw", "mailroom", "bulletin-config.json"), "utf-8"
+                    getBulletinConfigPath(), "utf-8"
                   ));
                   return cfg.consensusPartialThreshold ?? 0.3;
                 } catch { return 0.3; }
@@ -902,7 +1137,7 @@ const bulletinToolsPlugin = {
       );
       if (result.ok) {
         respond(true, result.payload);
-      } else {
+      } else if ("error" in result) {
         respond(false, undefined, result.error);
       }
     });
@@ -967,12 +1202,12 @@ const bulletinToolsPlugin = {
 
       // If subagent.run failed because we're outside gateway request scope,
       // fall back to HTTP self-call to /bulletin/wake
-      if (result.error.message.includes("gateway request")) {
+      if ("error" in result && result.error.message.includes("gateway request")) {
         console.log(`[bulletin-tools] Falling back to HTTP wake for '${agentId}'`);
         return wakeViaHttp(agentId, task, jobLabel);
       }
 
-      console.error(`[bulletin-tools] Wake failed for '${agentId}': ${result.error.message}`);
+      console.error(`[bulletin-tools] Wake failed for '${agentId}': ${"error" in result ? result.error.message : "unknown error"}`);
       return false;
     }
 
@@ -980,8 +1215,8 @@ const bulletinToolsPlugin = {
     async function wakeViaHttp(agentId: string, task: string, label: string): Promise<boolean> {
       const gatewayToken = (() => {
         try {
-          const cfgPath = join(homedir(), ".openclaw", "mailroom", "bulletin-config.json");
-          const cfg = JSON.parse(readFileSync(cfgPath, "utf-8"));
+          const cfg = loadBulletinConfig();
+          if (!cfg) return process.env.GATEWAY_AUTH_TOKEN;
           return resolveConfigToken(cfg.gatewayToken) ?? process.env.GATEWAY_AUTH_TOKEN;
         } catch {
           return process.env.GATEWAY_AUTH_TOKEN;
@@ -997,7 +1232,7 @@ const bulletinToolsPlugin = {
         const envPort = process.env.OPENCLAW_GATEWAY_PORT;
         if (envPort) return parseInt(envPort, 10) || 18789;
         try {
-          const cfg = JSON.parse(readFileSync(join(homedir(), ".openclaw", "openclaw.json"), "utf-8"));
+          const cfg = JSON.parse(readFileSync(getOpenClawConfigPath(), "utf-8"));
           return cfg.gateway?.port ?? 18789;
         } catch { return 18789; }
       })();

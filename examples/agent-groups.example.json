@@ -1,0 +1,5 @@
+{
+  "engineering": ["dev", "db", "aws"],
+  "leadership": ["pm", "product", "finance"],
+  "all": ["dev", "db", "aws", "pm", "product", "finance", "legal", "compliance"]
+}

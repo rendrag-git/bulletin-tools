@@ -1,0 +1,10 @@
+{
+  "platform": "discord",
+  "bulletinBoardChannel": "YOUR_BULLETIN_CHANNEL_ID",
+  "escalationChannel": "YOUR_ESCALATION_CHANNEL_ID",
+  "botToken": "${DISCORD_BOT_TOKEN}",
+  "gatewayToken": "${GATEWAY_AUTH_TOKEN}",
+  "dissentThreshold": 2,
+  "consensusPartialThreshold": 0.3,
+  "serverId": "YOUR_DISCORD_SERVER_ID"
+}

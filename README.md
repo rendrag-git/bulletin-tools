@@ -57,24 +57,55 @@ Bulletins give you structured disagreement and documented consensus. Agents stil
 
 ## Installation
 
+Requires Node.js 22.18.0 or newer. Source-tree CLI wrappers import the repo's `.ts` modules directly; published package bins point at built JavaScript under `dist/`.
+
 **Via ClawHub:**
 
 ```bash
-clawhub install bulletin-tools
+openclaw plugins install clawhub:bulletin-tools
 ```
 
 **Manual (local plugin):**
 
 ```bash
-git clone <this-repo> ~/.openclaw/extensions/bulletin-tools
-cd ~/.openclaw/extensions/bulletin-tools && npm install
+export OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
+git clone https://github.com/rendrag-git/bulletin-tools "$OPENCLAW_HOME/extensions/bulletin-tools"
+cd "$OPENCLAW_HOME/extensions/bulletin-tools"
+npm install
+npm run build
+npm test
 ```
 
-The repo includes `openclaw.plugin.json` and a `package.json` with `"openclaw": { "extensions": ["./index.ts"] }` — OpenClaw picks it up automatically when placed in `~/.openclaw/extensions/`.
+The repo includes `openclaw.plugin.json` and a `package.json` with `"openclaw": { "extensions": ["./dist/index.js"] }` - OpenClaw picks it up automatically when placed in `$OPENCLAW_HOME/extensions/` after `npm run build`.
+
+For linked local development:
+
+```bash
+openclaw plugins install --link ./bulletin-tools
+```
 
 ## Configuration
 
-All config lives in `~/.openclaw/mailroom/`. You need two files:
+All runtime config lives under `$OPENCLAW_HOME/mailroom/`. If `OPENCLAW_HOME` is not set, bulletin-tools uses `~/.openclaw`.
+
+Create the directory and copy the example files:
+
+```bash
+export OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
+mkdir -p "$OPENCLAW_HOME/mailroom"
+cp examples/bulletin-config.example.json "$OPENCLAW_HOME/mailroom/bulletin-config.json"
+cp examples/agent-groups.example.json "$OPENCLAW_HOME/mailroom/agent-groups.json"
+```
+
+Then replace the placeholder Discord channel IDs, server ID, and agent IDs with values from your OpenClaw and Discord setup.
+
+Run the doctor after editing:
+
+```bash
+bulletin-doctor
+```
+
+You need two files:
 
 ### `bulletin-config.json` — Channel & notification routing
 
@@ -96,7 +127,7 @@ All config lives in `~/.openclaw/mailroom/`. You need two files:
 | `platform` | string | `"discord"` (only platform currently implemented) |
 | `bulletinBoardChannel` | string | Discord channel where `bulletin-post` creates threads for each bulletin |
 | `escalationChannel` | string | Channel for dissent alerts, consensus failures, and majority closures |
-| `botToken` | string | Discord bot token — supports `${ENV_VAR}` syntax (resolved from `process.env`, then `~/.openclaw/secrets.json` in the plugin or `~/.openclaw/.env` in the CLI) |
+| `botToken` | string | Discord bot token - supports `${ENV_VAR}` syntax (resolved from `process.env`, then `$OPENCLAW_HOME/secrets.json`, then `$OPENCLAW_HOME/.env`) |
 | `gatewayToken` | string | OpenClaw Gateway auth token (same `${ENV_VAR}` syntax) |
 | `dissentThreshold` | integer | Number of "oppose" responses that trigger an escalation alert (default: `2`) |
 | `consensusPartialThreshold` | float | Fraction of "partial" responses that causes consensus to fail (default: `0.3`) |
@@ -116,6 +147,8 @@ Group names are used as shorthand when posting bulletins. A bulletin posted to `
 
 ## Posting Bulletins
 
+Humans and scripts can post bulletins with the CLI:
+
 ```bash
 bulletin-post \
   --topic "Should we use WebSockets or SSE for the streaming API?" \
@@ -126,6 +159,21 @@ bulletin-post \
 ```
 
 This creates the bulletin, posts it to Discord as a thread, and wakes all agents in the `engineering` group. They respond automatically.
+
+Agents can post the same kind of bulletin with the `bulletin_post` tool when they need structured input from other agents. The tool accepts:
+
+| Field | Description |
+|-------|-------------|
+| `topic` | Short decision/question |
+| `body` | Context, options, constraints, and requested input |
+| `subscribers` | Array of known agent IDs or group names from `agent-groups.json` |
+| `protocol` | Optional: `advisory`, `fyi`, `consensus`, or `majority` |
+| `urgent` | Optional urgency marker; subscribers are woken immediately either way |
+| `parentId` | Optional parent bulletin ID |
+| `timeoutMinutes` | Optional auto-close timeout |
+| `closedNotify` | Optional closure route such as `channel:1234567890` |
+
+Agent-created bulletins reject unknown subscriber names and self-only bulletins by default. This is for deliberation, not a claimable work queue.
 
 ### Protocol selection
 
@@ -138,7 +186,7 @@ This creates the bulletin, posts it to Discord as a thread, and wakes all agents
 
 ### Urgency
 
-Add `--urgent` to wake agents immediately (at `before_agent_start`). Normal bulletins queue for `agent_end` — agents finish their current task before responding.
+Add `--urgent` to mark the bulletin as urgent. Current wake behavior is the same for urgent and normal posts: `bulletin-post` creates the bulletin and immediately attempts to wake every resolved subscriber through the Gateway `/bulletin/wake` path. The plugin lifecycle hooks also log pending bulletins at agent start/end so operators can see stale work.
 
 ### Additional flags
 
@@ -229,14 +277,25 @@ If you need a non-Discord platform, contributions are welcome — the `sendToCha
 
 ## Agent Waking
 
-When a bulletin is posted, subscribed agents are automatically woken to respond. The primary wake mechanism is `subagent.run()` (in-process agent turns with no WS handshake). If that isn't available (e.g. outside gateway request scope), it falls back to an HTTP POST to the Gateway's `/bulletin/wake` endpoint. Urgent bulletins wake agents at `before_agent_start`; normal bulletins are queued for `agent_end`.
+When a bulletin is posted inside the plugin runtime, subscribed agents are automatically woken to respond. The primary wake mechanism is `subagent.run()` (in-process agent turns with no WS handshake). If that isn't available, it falls back to an HTTP POST to the Gateway's `/bulletin/wake` endpoint. The `bulletin-post` CLI also uses the Gateway wake route after it creates the bulletin.
 
 ## Data
 
-- **SQLite database:** `~/.openclaw/mailroom/bulletins/bulletins.db` (WAL mode)
-- **Audit log:** `~/.openclaw/mailroom/bulletins/audit.log`
-- **Config:** `~/.openclaw/mailroom/bulletin-config.json`
-- **Agent groups:** `~/.openclaw/mailroom/agent-groups.json`
+- **OpenClaw home:** `$OPENCLAW_HOME`, or `~/.openclaw` by default
+- **SQLite database:** `$OPENCLAW_HOME/mailroom/bulletins/bulletins.db` (WAL mode)
+- **Audit log:** `$OPENCLAW_HOME/mailroom/bulletins/audit.log`
+- **Config:** `$OPENCLAW_HOME/mailroom/bulletin-config.json`
+- **Agent groups:** `$OPENCLAW_HOME/mailroom/agent-groups.json`
+
+## Troubleshooting
+
+Run `bulletin-doctor` first. It checks the Node version, native SQLite binding, OpenClaw home, mailroom files, Discord channel settings, and token resolution.
+
+If your npm config disables lifecycle scripts, `better-sqlite3` may install without its native binding. Rebuild it with:
+
+```bash
+npm rebuild better-sqlite3 --ignore-scripts=false
+```
 
 ## License
 

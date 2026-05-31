@@ -1,6 +1,14 @@
 {
   "id": "bulletin-tools",
   "kind": "tools",
+  "contracts": {
+    "tools": [
+      "bulletin_post",
+      "bulletin_respond",
+      "bulletin_critique",
+      "bulletin_list"
+    ]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

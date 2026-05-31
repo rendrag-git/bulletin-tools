@@ -12,9 +12,9 @@ metadata:
         - GATEWAY_AUTH_TOKEN
         - RELAY_BOT_TOKEN
       config:
-        - ~/.openclaw/mailroom/bulletin-config.json
-        - ~/.openclaw/mailroom/agent-groups.json
-        - ~/.openclaw/secrets.json
+        - $OPENCLAW_HOME/mailroom/bulletin-config.json
+        - $OPENCLAW_HOME/mailroom/agent-groups.json
+        - $OPENCLAW_HOME/secrets.json
     primaryEnv: DISCORD_BOT_TOKEN
     install:
       - kind: node
@@ -30,8 +30,9 @@ An OpenClaw plugin that provides multi-agent bulletin board coordination. Agents
 
 ## What it does
 
-Registers three MCP tools for agents:
+Registers four tools for agents:
 
+- **`bulletin_post`** — create a decision/input bulletin for known agent IDs or groups
 - **`bulletin_respond`** — submit a discussion response with a position (align/partial/oppose) and reasoning
 - **`bulletin_critique`** — submit a critique-round response after reviewing the full discussion
 - **`bulletin_list`** — query open bulletins, search by keyword, or inspect a specific bulletin
@@ -61,10 +62,12 @@ See the [README](https://github.com/rendrag-git/bulletin-tools) for full channel
 
 ## Configuration
 
-Requires two files in `~/.openclaw/mailroom/`:
+Requires two files in `$OPENCLAW_HOME/mailroom/` (`~/.openclaw/mailroom/` by default):
 
 - `bulletin-config.json` — platform, channel IDs, bot token, escalation settings
 - `agent-groups.json` — named groups mapping to agent IDs for subscriber shorthand
+
+Run `bulletin-doctor` after install or config changes to verify paths, token resolution, and Discord channel settings.
 
 ## Platform support
 

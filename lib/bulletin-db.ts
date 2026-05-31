@@ -4,7 +4,8 @@
  * Replaces flat JSON bulletin storage with SQLite.
  * Uses better-sqlite3 for synchronous, embedded access.
  *
- * Database location: ~/.openclaw/mailroom/bulletins/bulletins.db
+ * Database location: $OPENCLAW_HOME/mailroom/bulletins/bulletins.db,
+ * or ~/.openclaw/mailroom/bulletins/bulletins.db by default.
  *
  * ⚠️ FTS Content-Sync: The FTS tables use content='bulletins' and
  * content='bulletin_responses' — they do NOT auto-update. Every INSERT
@@ -24,14 +25,17 @@ import {
   mkdirSync,
   appendFileSync,
 } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
+import {
+  getBulletinDbPath,
+  getBulletinsDir,
+  getDbAuditLogPath,
+} from "./paths.ts";
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
-const BULLETINS_DIR = join(homedir(), ".openclaw", "mailroom", "bulletins");
-const DB_PATH = join(BULLETINS_DIR, "bulletins.db");
-const AUDIT_LOG_PATH = join(BULLETINS_DIR, "bulletins.log");
+const BULLETINS_DIR = getBulletinsDir();
+const DB_PATH = getBulletinDbPath();
+const AUDIT_LOG_PATH = getDbAuditLogPath();
 
 // ── Types ───────────────────────────────────────────────────────────────────
 

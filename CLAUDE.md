@@ -2,6 +2,30 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Shared Instructions
+
+Read `AGENTS.md` first. It is the shared source of truth for tracker routing, guidepost discipline, goal-loop conventions, verification, and project-specific engineering rules.
+
+`GUIDEPOST.md` is the guarded project scope charter. Do not edit it without explicit user approval.
+
+Linear is canonical for issues, PRDs, blockers, acceptance, and long-running execution state. Use the `bulletin-tools` Linear project and the routing docs in `docs/agents/`.
+
+Claude `/goal` is a stop condition evaluated from transcript-visible state. End each turn with the acceptance or progress evidence needed by the evaluator. Do not enter Plan Mode mid-loop if it stops continuation.
+
+## Agent Skills
+
+### Issue Tracker
+
+Issues are tracked through Linear MCP in the `bulletin-tools` project. See `docs/agents/issue-tracker.md`.
+
+### Triage Labels
+
+Use the default five-role vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain Docs
+
+This repo uses a single-context domain-doc layout. See `docs/agents/domain.md`.
+
 ## What This Is
 
 An OpenClaw plugin (`@openclaw-local/bulletin-tools`) that provides a multi-agent bulletin board system. Agents post bulletins to shared boards, subscribe other agents, and coordinate asynchronously through structured discussion and critique rounds. The plugin registers MCP tools that agents call to interact with bulletins, and uses OpenClaw lifecycle hooks to auto-wake agents when they have pending bulletins.
@@ -12,7 +36,7 @@ An OpenClaw plugin (`@openclaw-local/bulletin-tools`) that provides a multi-agen
 npm install          # install deps (better-sqlite3)
 ```
 
-There is no build step — OpenClaw loads `.ts` files directly via the plugin SDK. There are no tests currently.
+Run `npm run build` before installing into OpenClaw; package installs use `dist/index.js`. Run `npm test` for the current smoke tests.
 
 ## Architecture
 
@@ -22,7 +46,7 @@ There is no build step — OpenClaw loads `.ts` files directly via the plugin SD
 
 - `lib/bulletin-db.ts` — SQLite persistence layer using `better-sqlite3`. All DB access is synchronous. Manages schema creation, CRUD, FTS (full-text search), read cursors, and audit logging.
 
-**Runtime data location:** `~/.openclaw/mailroom/bulletins/bulletins.db` (SQLite with WAL mode).
+**Runtime data location:** `$OPENCLAW_HOME/mailroom/bulletins/bulletins.db` (SQLite with WAL mode), defaulting to `~/.openclaw/mailroom/bulletins/bulletins.db`.
 
 ## Key Concepts
 
@@ -33,9 +57,9 @@ There is no build step — OpenClaw loads `.ts` files directly via the plugin SD
 
 **Rounds:** Bulletins progress `discussion` → `critique`. Round transitions and bulletin closes use atomic SQL updates (`UPDATE ... WHERE status = 'open'`) to prevent race conditions when multiple agents respond concurrently.
 
-**Agent waking:** When an agent starts (`before_agent_start`), urgent unresponded bulletins trigger a Gateway HTTP call (`/tools/invoke` → `sessions_spawn`) to spawn a dedicated bulletin-response session. Normal bulletins are handled at `agent_end`. Spawn locks (file-based, 10-min TTL) prevent duplicate wake calls.
+**Agent waking:** Bulletin wakes use `api.runtime.subagent.run()` with deterministic bulletin session keys. The plugin also registers `bulletin_wake` and an authenticated `/bulletin/wake` HTTP route as compatibility/fallback paths. Bulletin sessions use the `agent:bootstrap` hook to keep only minimal identity files.
 
-**Discord integration:** Responses, critiques, dissent alerts, and resolution notices are posted to Discord threads. Config lives in `~/.openclaw/mailroom/bulletin-config.json`. Bot tokens resolve via `${ENV_VAR}` syntax against `process.env` and `~/.openclaw/secrets.json`.
+**Discord integration:** Responses, critiques, dissent alerts, and resolution notices are posted to Discord threads. Config lives in `$OPENCLAW_HOME/mailroom/bulletin-config.json`. Bot tokens resolve via `${ENV_VAR}` syntax against `process.env`, `$OPENCLAW_HOME/secrets.json`, and `$OPENCLAW_HOME/.env`.
 
 ## FTS Content-Sync Warning
 
@@ -43,5 +67,5 @@ The FTS tables (`bulletins_fts`, `responses_fts`) use `content=` mode — they d
 
 ## External Dependencies
 
-- Gateway API at `127.0.0.1:{port}` (default 18789) for spawning agent sessions.
+- Gateway API at `127.0.0.1:{port}` (default 18789) for `/bulletin/wake` fallback calls.
 - Discord notifications (`lib/discord-notify.ts`) are inlined. Long-term these should go through OpenClaw's message tool so the plugin isn't Discord-specific.
