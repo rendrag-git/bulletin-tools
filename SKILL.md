@@ -1,7 +1,7 @@
 ---
 name: bulletin-tools
 description: Multi-agent bulletin board — post bulletins, subscribe agents, run structured discussion and critique rounds, and resolve decisions asynchronously across OpenClaw agents.
-version: 0.2.1
+version: 0.2.2
 metadata:
   openclaw:
     requires:
@@ -58,7 +58,7 @@ Bulletins post to a configured Discord channel as threads. Each bulletin = one t
 
 Per-bulletin `closedNotify` lets you route closure summaries to topic-specific channels so stakeholders get outcomes without following the main bulletin channel.
 
-See the [README](https://github.com/rendrag-git/bulletin-tools) for full channel visibility setup patterns.
+See the [README](https://github.com/rendrag-git/bulletin-tools) for setup, and `docs/coordination-model.md` for channel visibility patterns.
 
 ## Configuration
 

@@ -1,6 +1,6 @@
 {
   "name": "bulletin-tools-plugin",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "license": "MIT-0",
   "type": "module",
   "engines": {
@@ -15,6 +15,8 @@
     "SKILL.md",
     "openclaw.plugin.json",
     "dist/",
+    "docs/coordination-model.md",
+    "docs/agents/",
     "examples/",
     "global.d.ts",
     "index.ts",
