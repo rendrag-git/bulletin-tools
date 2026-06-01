@@ -1,6 +1,6 @@
 {
   "name": "bulletin-tools-plugin",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "license": "MIT-0",
   "type": "module",
   "engines": {
@@ -32,6 +32,11 @@
   },
   "peerDependencies": {
     "openclaw": ">=2026.2.0"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
   },
   "openclaw": {
     "extensions": [
