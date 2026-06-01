@@ -42,7 +42,7 @@ Run `npm run build` before installing into OpenClaw; package installs use `dist/
 
 **Two files, two layers:**
 
-- `index.ts` — Plugin entry point. Registers three tools (`bulletin_respond`, `bulletin_critique`, `bulletin_list`) via `api.registerTool()` and three lifecycle hooks (`before_agent_start`, `agent_end`, `before_message_write`). Contains all Discord notification logic, spawn-lock management, and completion/escalation workflows.
+- `index.ts` — Plugin entry point. Registers tools (`bulletin_post`, `bulletin_respond`, `bulletin_critique`, `bulletin_list`) via `api.registerTool()` and lifecycle hooks (`before_prompt_build`, `agent_end`, `before_message_write`). Contains all Discord notification logic, spawn-lock management, and completion/escalation workflows.
 
 - `lib/bulletin-db.ts` — SQLite persistence layer using `better-sqlite3`. All DB access is synchronous. Manages schema creation, CRUD, FTS (full-text search), read cursors, and audit logging.
 

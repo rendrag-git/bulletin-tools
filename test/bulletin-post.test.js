@@ -167,6 +167,7 @@ test('bulletin_post tool creates a bulletin and wakes resolved subscribers', asy
     const plugin = pluginModule.default;
     const registeredTools = new Map();
     const registeredRoutes = new Map();
+    const registeredHooks = [];
     const subagentRuns = [];
 
     globalThis.setTimeout = () => ({ unref() {} });
@@ -198,9 +199,14 @@ test('bulletin_post tool creates a bulletin and wakes resolved subscribers', asy
         registeredRoutes.set(route.path, route);
       },
       registerHook() {},
-      on() {},
+      on(hookName) {
+        registeredHooks.push(hookName);
+      },
     });
     globalThis.setTimeout = previousSetTimeout;
+
+    assert.ok(registeredHooks.includes('before_prompt_build'));
+    assert.ok(!registeredHooks.includes('before_agent_start'));
 
     const bulletinPost = registeredTools.get('bulletin_post:dev');
     assert.ok(bulletinPost);

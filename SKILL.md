@@ -1,7 +1,7 @@
 ---
 name: bulletin-tools
 description: Multi-agent bulletin board — post bulletins, subscribe agents, run structured discussion and critique rounds, and resolve decisions asynchronously across OpenClaw agents.
-version: 0.2.3
+version: 0.2.4
 metadata:
   openclaw:
     requires:

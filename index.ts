@@ -1314,7 +1314,7 @@ const bulletinToolsPlugin = {
 
     // ── Bulletin lifecycle hooks (passive — waking happens at post-time) ──
 
-    api.on("before_agent_start", async (_event, ctx) => {
+    api.on("before_prompt_build", async (_event, ctx) => {
       const agentId = ctx.agentId;
       if (!agentId) return;
       if (ctx.sessionKey?.includes(":bulletin:")) return;
@@ -1328,7 +1328,7 @@ const bulletinToolsPlugin = {
         }
       } catch (err) {
         console.error(
-          "[bulletin-tools] before_agent_start hook error:",
+          "[bulletin-tools] before_prompt_build hook error:",
           err instanceof Error ? err.message : String(err),
         );
       }
